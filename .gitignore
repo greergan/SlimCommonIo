@@ -1,0 +1,11 @@
+Makefile
+CMakeLists.txt
+cmake
+build
+dist
+
+# IDE
+.idea/
+.vscode/
+.vs/
+.cache/

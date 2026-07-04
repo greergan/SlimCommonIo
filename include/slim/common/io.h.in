@@ -1,0 +1,48 @@
+#pragma once
+#include <atomic>
+#include <cstdint>
+#include <linux/io_uring.h>
+
+#define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
+#define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
+namespace slim::common {
+
+struct IO {
+    struct Sq {
+        std::atomic<uint32_t>* head;
+        std::atomic<uint32_t>* tail;
+        std::atomic<uint32_t>* flags;
+        uint32_t*              mask;
+        uint32_t*              entries;
+        uint32_t*              dropped;
+        uint32_t*              array;
+        io_uring_sqe*          sqes;
+        void*                  map;
+        void*                  sqes_map;
+        size_t                 map_size;
+        size_t                 sqes_map_size;
+    };
+
+    struct Cq {
+        std::atomic<uint32_t>* head;
+        std::atomic<uint32_t>* tail;
+        uint32_t*              mask;
+        uint32_t*              entries;
+        io_uring_cqe*          cqes;
+        void*                  map;
+        size_t                 map_size;
+    };
+
+    int fd{-1};
+    Sq  sq{};
+    Cq  cq{};
+
+    explicit IO(uint32_t entries = 256);
+    ~IO();
+
+    IO(const IO&)            = delete;
+    IO& operator=(const IO&) = delete;
+};
+
+} // namespace slim::common

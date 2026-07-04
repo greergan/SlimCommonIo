@@ -1,0 +1,107 @@
+#pragma once
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cstdint>
+#include <linux/io_uring.h>
+#include <slim/common/io/awaitable.h>
+
+#define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
+#define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
+namespace slim::common::io {
+
+struct Accept : Awaitable {
+    int              server_fd;
+    sockaddr_storage addr{};
+    socklen_t        addr_len{sizeof(addr)};
+
+    Accept(IO& io, int server_fd);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Close : Awaitable {
+    int fd;
+
+    Close(IO& io, int fd);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Open : Awaitable {
+    int         dfd;
+    const char* path;
+    int         flags;
+    mode_t      mode;
+
+    Open(IO& io, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Read : Awaitable {
+    int      fd;
+    void*    buf;
+    size_t   len;
+    uint64_t offset;
+
+    Read(IO& io_ref, int fd_, void* buf, size_t len, uint64_t offset = 0);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Recv : Awaitable {
+    int    fd;
+    void*  buf;
+    size_t len;
+    int    flags;
+
+    Recv(IO& io_ref, int fd_, void* buf, size_t len, int flags = 0);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Send : Awaitable {
+    int         fd;
+    const void* buf;
+    size_t      len;
+    int         flags;
+
+    Send(IO& io_ref, int fd_, const void* buf, size_t len, int flags = 0);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Stat : Awaitable {
+    int          dfd;
+    const char*  path;
+    struct statx buf{};
+    int          flags;
+    uint32_t     mask;
+
+    Stat(IO& io_ref, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd_ = AT_FDCWD);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Write : Awaitable {
+    int         fd;
+    const void* buf;
+    size_t      len;
+    uint64_t    offset;
+
+    Write(IO& io_ref, int fd_, const void* buf, size_t len, uint64_t offset = 0);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+} // namespace slim::common::io

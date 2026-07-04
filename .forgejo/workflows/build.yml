@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: self-hosted
+
+    container:
+      image: slim-toolchain
+      options: --privileged
+
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+
+      - name: Checkout SlimLibraryPackager
+        uses: actions/checkout@v4
+        with:
+          repository: greergan/SlimLibraryPackager
+          path: SlimLibraryPackager
+          ref: master
+
+      - name: Update env
+        run: |
+          chmod +x ./SlimLibraryPackager/update_env.sh
+          ./SlimLibraryPackager/update_env.sh
+
+      - name: Build
+        run: |
+          if [ -z "${{ vars.GIT_URL }}" ]; then
+            echo "Error: GIT_URL variable is not set in Forgejo UI."
+            exit 1
+          fi
+          if [ -z "${{ vars.REPO_OWNER }}" ]; then
+            echo "Error: REPO_OWNER variable is not set in Forgejo UI."
+            exit 1
+          fi
+          make RELEASE_TYPE=RELEASE SHARED_ONLY=OFF SLIM_GIT_URL="${{ vars.GIT_URL }}" SLIM_GIT_REPO_OWNER="${{ vars.REPO_OWNER }}"
+
+      # --- NEW: Email Notification Step ---
+      - name: Send mail on failure
+        if: failure()
+        uses: https://github.com/dawidd6/action-send-mail@v3
+        with:
+          # Server Configuration (from Forgejo Variables)
+          server_address: ${{ vars.SMTP_SERVER_ADDR }}
+          server_port: ${{ vars.SMTP_SERVER_PORT }}
+          
+          # Credentials (Username is a var, Password is a secret)
+          username: ${{ vars.SMTP_USER }}
+          password: ${{ secrets.SMTP_SERVER_PASSWORD }}
+          
+          # Email Details (Wrapped subject in quotes to fix YAML parsing)
+          subject: "🚨 Build Failed: ${{ github.repository }}"
+          to: ${{ vars.NOTIFICATIONS_EMAIL }}
+          from: ${{ vars.NOTIFICATIONS_FROM_EMAIL }}
+          body: |
+            The build job "${{ github.job }}" failed on branch "${{ github.ref_name }}".
+            Commit: ${{ github.sha }}
+            
+            View the detailed build logs here:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}

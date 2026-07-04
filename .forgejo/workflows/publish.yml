@@ -1,0 +1,118 @@
+name: build
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 1.0.1)'
+        required: false
+jobs:
+  build-and-publish:
+    runs-on: self-hosted
+    container:
+      image: slim-toolchain
+      options: --privileged
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Checkout SlimLibraryPackager
+        uses: actions/checkout@v4
+        with:
+          repository: greergan/SlimLibraryPackager
+          path: SlimLibraryPackager
+          ref: master
+
+      - name: Validate configuration
+        run: |
+          # Validate Variables
+          if [ -z "${{ vars.GIT_URL }}" ]; then
+            echo "Error: vars.GIT_URL is not set in Forgejo UI."
+            exit 1
+          fi
+          if [ -z "${{ vars.REPO_OWNER }}" ]; then
+            echo "Error: vars.REPO_OWNER is not set in Forgejo UI."
+            exit 1
+          fi
+          # Note: secrets cannot be reliably validated via shell conditionals
+          # (unset secrets resolve to empty string identically to set-but-empty).
+          # Auth failures will be surfaced by curl --fail in the publish step.
+
+      - name: Determine Version
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+          else
+            echo "VERSION=0.0.0" >> $GITHUB_ENV
+          fi
+
+      - name: Update env
+        run: bash ./SlimLibraryPackager/update_env.sh
+
+      - name: Build Packages
+        run: |
+          make packages SLIM_GIT_URL="${{ vars.GIT_URL }}" SLIM_GIT_REPO_OWNER="${{ vars.REPO_OWNER }}"
+
+      - name: Publish to Forgejo Registry
+        run: |
+          REG_URL="${{ vars.GIT_URL }}"
+          REG_URL="${REG_URL%/}"
+          OWNER="${{ vars.REPO_OWNER }}"
+          REPO="${{ github.event.repository.name }}"
+          shopt -s nullglob
+          files=(dist/*.deb dist/*.rpm)
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No packages found in dist/" && exit 1
+          fi
+
+          for file in "${files[@]}"; do
+            FILENAME=$(basename "$file")
+
+            # Extract version from filename; fall back to env VERSION
+            FILE_VERSION=$(echo "$FILENAME" | sed -n 's/.*v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
+            VERSION_TO_USE="${FILE_VERSION:-$VERSION}"
+
+            if [[ -z "$VERSION_TO_USE" ]]; then
+              echo "Error: could not determine version for $FILENAME"
+              exit 1
+            fi
+
+            BASE_URL="$REG_URL/api/packages/$OWNER/generic/$REPO/$VERSION_TO_USE"
+            echo "Publishing $FILENAME → $BASE_URL/$FILENAME"
+
+            curl --fail -sS \
+                 --user "${{ secrets.REGISTRY_USER }}:${{ secrets.REGISTRY_TOKEN }}" \
+                 --upload-file "$file" \
+                 "$BASE_URL/$FILENAME" \
+                 || { echo "Failed to publish $FILENAME"; exit 1; }
+          done
+
+      - name: Send mail on failure
+        if: failure()
+        uses: https://github.com/dawidd6/action-send-mail@v3
+        with:
+          # Server Configuration (from Forgejo Variables)
+          server_address: ${{ vars.SMTP_SERVER_ADDR }}
+          server_port: ${{ vars.SMTP_SERVER_PORT }}
+          
+          # Credentials (Username is a var, Password is a secret)
+          username: ${{ vars.SMTP_USER }}
+          password: ${{ secrets.SMTP_SERVER_PASSWORD }}
+          
+          # Email Details (Wrapped subject in quotes to fix YAML parsing)
+          subject: "🚨 Build Failed: ${{ github.repository }}"
+          to: ${{ vars.NOTIFICATIONS_EMAIL }}
+          from: ${{ vars.NOTIFICATIONS_FROM_EMAIL }}
+          body: |
+            The build job "${{ github.job }}" failed on branch "${{ github.ref_name }}".
+            Commit: ${{ github.sha }}
+            
+            View the detailed build logs here:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}

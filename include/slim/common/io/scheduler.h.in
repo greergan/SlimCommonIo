@@ -1,0 +1,52 @@
+#pragma once
+#include <stop_token>
+#include <vector>
+#include <slim/common/io.h>
+#include <slim/common/io/task.h>
+
+#define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
+#define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
+namespace slim::common::io {
+
+struct Scheduler {
+    explicit Scheduler(IO& io_ref);
+    ~Scheduler();
+
+    Scheduler(const Scheduler&)            = delete;
+    Scheduler& operator=(const Scheduler&) = delete;
+
+    // Enqueue a task and run it until its first suspension point.
+    //
+    // IMPORTANT: The coroutine must not capture variables that outlive the caller's
+    // scope. When passing a lambda coroutine, bind it to a named variable before
+    // invoking it — do NOT pass an inline temporary lambda directly:
+    //
+    //   auto coro = [&]() -> Task<void> { ... };  // named — correct
+    //   sched.spawn(coro());
+    //
+    //   sched.spawn([&]() -> Task<void> { ... }()); // temporary — UB with GCC coroutines
+    //
+    // GCC may elide the closure copy into the coroutine frame when the lambda is a
+    // prvalue, leaving the frame with a dangling reference after the temporary is destroyed.
+    template<typename T>
+    void spawn(Task<T>&& task) {
+        // Resume before push_back so that reallocation of tasks_ cannot interleave
+        // with the initial run of the coroutine body.
+        auto handle = task.handle();
+        handle.resume();
+        tasks_.push_back(std::move(task));
+    }
+
+    void run(std::stop_token stop_token);
+    void shutdown();
+
+private:
+    std::vector<Task<void>> tasks_;
+    IO&                     io_;
+
+    void drain();
+    void reap();
+};
+
+} // namespace slim::common::io
