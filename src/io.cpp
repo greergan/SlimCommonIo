@@ -13,6 +13,8 @@
 namespace slim::common {
 
 IO::IO(uint32_t entries) {
+    if (entries == 0) throw io::IOException(io::ErrorStatus::IOInvalidEntries);
+
     io_uring_params params{};
     std::memset(&params, 0, sizeof(params));
 

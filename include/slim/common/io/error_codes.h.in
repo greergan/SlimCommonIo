@@ -7,20 +7,24 @@ namespace slim::common::io {
 
 enum class ErrorStatus : uint32_t {
     OK,
+    BadAllocation,   // Memory allocation failed (std::bad_alloc)
     IOInvalidEntries,
     IOMmapCqFailed,
     IOMmapSqesFailed,
     IOMmapSqFailed,
     IOSetupFailed,
+    SQFull,          // Submission queue was full when an operation was attempted
 };
 
 constexpr std::string_view error_status_str[] = {
     "OK",                     // OK
+    "Bad allocation",         // BadAllocation
     "IO invalid entries",     // IOInvalidEntries
     "IO mmap CQ ring failed", // IOMmapCqFailed
     "IO mmap SQEs failed",    // IOMmapSqesFailed
     "IO mmap SQ ring failed", // IOMmapSqFailed
     "IO setup failed",        // IOSetupFailed
+    "Submission queue full",  // SQFull
 };
 
 constexpr std::string_view to_string(ErrorStatus status) {
@@ -30,8 +34,7 @@ constexpr std::string_view to_string(ErrorStatus status) {
 class IOException : public std::runtime_error {
 public:
     explicit IOException(ErrorStatus status)
-        : std::runtime_error(std::string(to_string(status)))
-        , status_(status) {}
+        : std::runtime_error(std::string(to_string(status))), status_(status) {}
 
     ErrorStatus status() const noexcept { return status_; }
 

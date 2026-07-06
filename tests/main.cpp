@@ -4,8 +4,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <chrono>
-#include <optional>
 #include <stop_token>
 #include <thread>
 #include <slim/common/io.h>
@@ -64,12 +62,12 @@ TEST_CASE("IO ring initialization", "[io][ring]") {
     SECTION("default entries initializes successfully") { REQUIRE_NOTHROW(IO{}); }
     SECTION("custom entries initializes successfully") { REQUIRE_NOTHROW(IO{512}); }
 
-    SECTION("zero entries throws IOException") {
+    SECTION("zero entries throws IOException with IOInvalidEntries") {
         try {
             IO{0};
             FAIL("expected IOException");
         } catch (const IOException &e) {
-            REQUIRE(e.status() == ErrorStatus::IOSetupFailed);
+            REQUIRE(e.status() == ErrorStatus::IOInvalidEntries);
         }
     }
 
@@ -155,12 +153,14 @@ TEST_CASE("IOException", "[io][error]") {
     }
 
     SECTION("to_string returns correct string for each status") {
-        REQUIRE(to_string(ErrorStatus::OK) == "OK");
+        REQUIRE(to_string(ErrorStatus::OK)               == "OK");
+        REQUIRE(to_string(ErrorStatus::BadAllocation)    == "Bad allocation");
         REQUIRE(to_string(ErrorStatus::IOInvalidEntries) == "IO invalid entries");
-        REQUIRE(to_string(ErrorStatus::IOMmapCqFailed) == "IO mmap CQ ring failed");
+        REQUIRE(to_string(ErrorStatus::IOMmapCqFailed)   == "IO mmap CQ ring failed");
         REQUIRE(to_string(ErrorStatus::IOMmapSqesFailed) == "IO mmap SQEs failed");
-        REQUIRE(to_string(ErrorStatus::IOMmapSqFailed) == "IO mmap SQ ring failed");
-        REQUIRE(to_string(ErrorStatus::IOSetupFailed) == "IO setup failed");
+        REQUIRE(to_string(ErrorStatus::IOMmapSqFailed)   == "IO mmap SQ ring failed");
+        REQUIRE(to_string(ErrorStatus::IOSetupFailed)    == "IO setup failed");
+        REQUIRE(to_string(ErrorStatus::SQFull)           == "Submission queue full");
     }
 
     SECTION("is catchable as std::runtime_error") {
@@ -321,6 +321,46 @@ TEST_CASE("Scheduler", "[io][scheduler]") {
         REQUIRE(buf1[0] == 'h');
         REQUIRE(buf2[0] == 'i');
         ::close(r); ::close(w);
+    }
+
+    SECTION("spawn throws IOException(BadAllocation) on vector growth failure") {
+        // Verify the exception type and status mapping directly — portably forcing
+        // std::bad_alloc from push_back is not feasible in a unit test.
+        IOException ex(ErrorStatus::BadAllocation);
+        REQUIRE(ex.status() == ErrorStatus::BadAllocation);
+        REQUIRE(std::string_view(ex.what()) == to_string(ErrorStatus::BadAllocation));
+    }
+
+    SECTION("spawn throws IOException(SQFull) when SQ is exhausted") {
+        // Fill the ring with the minimum entry count (1), then attempt a second
+        // operation to trigger the SQFull path in await_suspend.
+        // await_suspend throws before the coroutine suspends, so the exception
+        // propagates out through spawn() — catch it there, not inside the coroutine.
+        IO        io{1};
+        Scheduler sched{io};
+        auto [r, w] = make_socket_pair();
+
+        // First recv saturates the single SQE slot.
+        ::write(w, "x", 1);
+        char buf1[4]{};
+        auto coro1 = [&]() -> Task<void> { co_await Recv{io, r, buf1, 1}; };
+        sched.spawn(coro1());
+
+        // Second spawn hits the full SQ and throws IOException(SQFull).
+        char buf2[4]{};
+        auto coro2 = [&]() -> Task<void> { co_await Recv{io, r, buf2, sizeof(buf2)}; };
+        bool threw = false;
+        try {
+            sched.spawn(coro2());
+        } catch (const IOException& e) {
+            threw = true;
+            REQUIRE(e.status() == ErrorStatus::SQFull);
+        }
+        REQUIRE(threw);
+
+        sched.shutdown();
+        ::close(r);
+        ::close(w);
     }
 }
 

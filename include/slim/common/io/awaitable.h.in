@@ -1,33 +1,31 @@
 #pragma once
 #include <coroutine>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <linux/io_uring.h>
 #include <slim/common/io.h>
-
+#include <slim/common/io/error_codes.h>
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
-
 namespace slim::common::io {
-
-struct Awaitable {
-    IO&                     io;
+// Side-channel read by spawn() after handle.resume() to detect SQFull.
+// Returns a pointer to a thread-local IOException if await_suspend() found
+// the SQ full; nullptr otherwise. Clears the flag on read.
+IOException* take_pending_sq_error() noexcept;
+class Awaitable {
+public:
     int                     result{0};
     std::coroutine_handle<> handle{};
-
     explicit Awaitable(IO& io_ref);
     virtual ~Awaitable() = default;
-
-    bool await_ready() const noexcept;
-    void await_suspend(std::coroutine_handle<> h) noexcept;
+    bool await_ready()  const noexcept;
+    bool await_suspend(std::coroutine_handle<> h);
     int  await_resume() const noexcept;
-
 protected:
     virtual void prepare(io_uring_sqe* sqe) noexcept = 0;
-
 private:
+    IO&           io_;
     io_uring_sqe* acquire_sqe() noexcept;
     void          submit() noexcept;
 };
-
 } // namespace slim::common::io

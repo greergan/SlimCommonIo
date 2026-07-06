@@ -32,11 +32,11 @@ CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://co
 This library provides a coroutine-native async I/O layer backed directly by `io_uring` via raw `SYS_io_uring_setup` / `SYS_io_uring_enter` syscalls:
 
 - Manual SQ and CQ ring setup with `mmap`, including `IORING_FEAT_SINGLE_MMAP` optimization
-- A C++20 coroutine `Task<T>` type (with `void` specialization) for expressing async work
-- An `Awaitable` base that hooks directly into the coroutine awaiter protocol and submits SQEs
+- A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
+- An `Awaitable` base that hooks directly into the coroutine awaiter protocol and stages SQEs for batched submission
 - Seven concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
-- A cooperative `Scheduler` that drives the event loop, blocks on the kernel when the CQ is empty, and reaps completed tasks
-- An `ErrorStatus` enum and `IOException` for constructor-time failures; all I/O operations return raw `int` results following Linux errno convention
+- A cooperative `Scheduler` that drives the event loop, submits staged SQEs and blocks on the kernel when the CQ is empty, and reaps completed tasks
+- An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
 
 [↑ Top](#table-of-contents)
 
@@ -46,10 +46,11 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 |---------|-------------|
 | Raw `io_uring` | Ring setup, SQE submission, and CQE reaping done manually — no liburing dependency |
 | Single-mmap optimization | CQ ring reuses the SQ `mmap` allocation when `IORING_FEAT_SINGLE_MMAP` is available |
-| Coroutine tasks | `Task<T>` / `Task<void>` implement the C++20 coroutine promise protocol; always suspend at start |
+| Coroutine tasks | `Task<T>` implements the C++20 coroutine promise protocol via a `ValueStore<T>` base; always suspends at start; handles both value and `void` returns in a single template |
 | Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()` |
-| SQ backpressure | If the SQ is full, `Awaitable` completes synchronously with `-EBUSY` rather than blocking or dropping |
-| Blocking drain | `Scheduler::drain()` issues `IORING_ENTER_GETEVENTS` when the CQ is empty, avoiding a busy loop |
+| SQ backpressure | If the SQ is full when `Scheduler::spawn()` is called, `spawn()` throws `IOException(ErrorStatus::SQFull)` |
+| Batched submission | SQEs are staged in `await_suspend` and flushed to the kernel in a single `io_uring_enter` call at the start of each `drain()` tick |
+| Blocking drain | `Scheduler::drain()` issues `IORING_ENTER_GETEVENTS` when the CQ is empty after submission, avoiding a busy loop |
 | Cooperative scheduler | `Scheduler::run()` loops drain → reap until a `std::stop_token` fires; `shutdown()` flushes all pending tasks |
 | Linux-only | Requires Linux 5.1+ (`io_uring`) and `linux/io_uring.h` kernel headers; no platform abstraction layer |
 
@@ -71,7 +72,7 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | `Recv::flags` | `0` | `MSG_*` flags passed to the underlying `recv` |
 | `Send::flags` | `0` | `MSG_*` flags passed to the underlying `send` |
 | `Accept` socket flags | `SOCK_NONBLOCK \| SOCK_CLOEXEC` | Always applied; not overridable via the constructor |
-| `Awaitable::result` | `0` | Overwritten by the CQE result or `-EBUSY` on SQ-full |
+| `Awaitable::result` | `0` | Overwritten by the CQE result on completion |
 
 [↑ Top](#table-of-contents)
 
@@ -100,7 +101,7 @@ slim::common::IO io(512); // custom ring depth
 
 | Form | Description |
 |------|-------------|
-| `IO(uint32_t entries = 256)` | Sets up the `io_uring` instance. CQ is provisioned at `entries * 2`. Throws `IOException` on `io_uring_setup` failure or any `mmap` failure; see [Error Model](#error-model) |
+| `IO(uint32_t entries = 256)` | Sets up the `io_uring` instance. CQ is provisioned at `entries * 2`. Throws `IOException` on zero entries, `io_uring_setup` failure, or any `mmap` failure; see [Error Model](#error-model) |
 | `~IO()` | Unmaps all rings (skips the CQ unmap when `IORING_FEAT_SINGLE_MMAP` was used), unmaps the SQEs array, and closes `fd` |
 | Copy | Deleted |
 
@@ -113,7 +114,7 @@ slim::common::io::Task<int>  t;   // value-returning task
 slim::common::io::Task<void> t;   // fire-and-forget task
 ```
 
-`Task<T>` is the coroutine return type used throughout the library. It always suspends at the initial suspend point — the coroutine body does not begin running until `resume()` is called or the task is handed to `Scheduler::spawn()`.
+`Task<T>` is the coroutine return type used throughout the library. It is a single unified template: value storage and the `return_value` / `return_void` promise methods are provided by a `ValueStore<T>` base, which is explicitly specialised for `void` to avoid the ill-formed `void v` parameter that arises from naive `requires`-guarded approaches. The coroutine always suspends at the initial suspend point — the body does not begin running until `resume()` is called or the task is handed to `Scheduler::spawn()`.
 
 `Task<T>` is non-copyable. It is move-only and destroys its coroutine handle on destruction.
 
@@ -123,8 +124,6 @@ slim::common::io::Task<void> t;   // fire-and-forget task
 | `done()` | `bool` | Returns `true` if the coroutine has completed |
 | `result()` | `T` | Returns the coroutine's return value, or rethrows a stored exception |
 | `handle()` | `std::coroutine_handle<Promise>` | Raw handle; used internally by `Scheduler::spawn()` |
-
-`Task<void>` is a full specialization with the same interface; `result()` returns `void` and rethrows any stored exception.
 
 [↑ Top](#table-of-contents)
 
@@ -139,12 +138,12 @@ protected:
 };
 ```
 
-`Awaitable` implements the C++20 awaiter protocol and handles all SQE acquisition and submission boilerplate. Subclasses only override `prepare()` to fill in the opcode and operation-specific fields.
+`Awaitable` implements the C++20 awaiter protocol and handles all SQE acquisition boilerplate. Subclasses only override `prepare()` to fill in the opcode and operation-specific fields. SQEs are staged in the ring on suspension and flushed to the kernel in batch by `Scheduler::drain()`.
 
 | Method | Description |
 |--------|-------------|
 | `await_ready()` | Always returns `false` — every operation suspends the coroutine |
-| `await_suspend(handle)` | Acquires an SQE, calls `prepare()`, sets `user_data` to `this`, and submits. If the SQ is full, sets `result = -EBUSY` and immediately resumes the coroutine |
+| `await_suspend(handle)` | Acquires an SQE, calls `prepare()`, and sets `user_data` to `this`. If the SQ is full, sets a thread-local error flag and returns `false` to resume the coroutine immediately without suspending; `Scheduler::spawn()` detects this flag after `resume()` returns and throws `IOException(ErrorStatus::SQFull)` |
 | `await_resume()` | Returns `result` as `int` |
 | `prepare(sqe)` | Pure virtual. Called with a zeroed SQE slot; subclass fills opcode and fields |
 
@@ -178,11 +177,11 @@ slim::common::io::Scheduler sched(io);
 
 | Method | Description |
 |--------|-------------|
-| `spawn(Task<T>&&)` | Resumes the task to its first suspension point, then takes ownership. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
+| `spawn(Task<T>&&)` | Resumes the task to its first suspension point, then takes ownership. Throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full, or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
 | `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled |
 | `shutdown()` | Flushes all remaining tasks by looping `drain()` → `reap()` until the task list is empty. Called automatically by the destructor if tasks remain |
 
-**`drain()`** — processes all available CQEs. If the CQ is empty it blocks in the kernel via `IORING_ENTER_GETEVENTS` until at least one event arrives, then resumes the associated coroutine for each CQE. The CQ head is advanced in a single batch store after all CQEs in the snapshot are processed.
+**`drain()`** — first submits all SQEs staged since the last tick via a single `io_uring_enter` call, then processes all available CQEs. If the CQ is still empty after submission it blocks in the kernel via `IORING_ENTER_GETEVENTS` until at least one event arrives, then resumes the associated coroutine for each CQE. The CQ head is advanced in a single batch store after all CQEs in the snapshot are processed.
 
 **`reap()`** — sweeps `tasks_` and erases completed entries. Currently O(n); an intrusive list is the recommended optimization for high-IOPS paths.
 
@@ -198,16 +197,18 @@ sched.spawn(coro());  // correct — named variable
 
 ## Error Model
 
-Constructor failures on `IO` are reported via `IOException`, a `std::runtime_error` subclass that carries an `ErrorStatus`.
+Constructor failures on `IO` and spawn-time failures on `Scheduler` are reported via `IOException`, a `std::runtime_error` subclass that carries an `ErrorStatus`.
 
 | `ErrorStatus` | String | Meaning |
 |---------------|--------|---------|
 | `OK` | `"OK"` | No error |
-| `IOInvalidEntries` | `"IO invalid entries"` | Reserved; not yet thrown |
+| `BadAllocation` | `"Bad allocation"` | `Scheduler::spawn()` could not grow the internal task vector |
+| `IOInvalidEntries` | `"IO invalid entries"` | `IO` constructed with zero entries |
 | `IOMmapCqFailed` | `"IO mmap CQ ring failed"` | CQ ring `mmap` failed (legacy kernels without `IORING_FEAT_SINGLE_MMAP`) |
 | `IOMmapSqesFailed` | `"IO mmap SQEs failed"` | SQEs array `mmap` failed |
 | `IOMmapSqFailed` | `"IO mmap SQ ring failed"` | SQ ring `mmap` failed |
 | `IOSetupFailed` | `"IO setup failed"` | `SYS_io_uring_setup` returned a negative fd |
+| `SQFull` | `"Submission queue full"` | `Scheduler::spawn()` was called while every SQ slot was occupied |
 
 `IOException::status()` returns the `ErrorStatus` value. `what()` returns the corresponding string from `error_status_str[]`.
 
