@@ -3,28 +3,41 @@
 #include <stdexcept>
 #include <string_view>
 
+#define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
+#define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
 namespace slim::common::io {
 
 enum class ErrorStatus : uint32_t {
     OK,
-    BadAllocation,   // Memory allocation failed (std::bad_alloc)
+    BadAllocation,
+    EpollCreateFailed,
+    EpollCtlFailed,
+    EventFdCreateFailed,
+    EventFdReadFailed,
+    EventFdWriteFailed,
     IOInvalidEntries,
     IOMmapCqFailed,
     IOMmapSqesFailed,
     IOMmapSqFailed,
     IOSetupFailed,
-    SQFull,          // Submission queue was full when an operation was attempted
+    SQFull,
 };
 
 constexpr std::string_view error_status_str[] = {
-    "OK",                     // OK
-    "Bad allocation",         // BadAllocation
-    "IO invalid entries",     // IOInvalidEntries
-    "IO mmap CQ ring failed", // IOMmapCqFailed
-    "IO mmap SQEs failed",    // IOMmapSqesFailed
-    "IO mmap SQ ring failed", // IOMmapSqFailed
-    "IO setup failed",        // IOSetupFailed
-    "Submission queue full",  // SQFull
+    "OK",                          // OK
+    "Bad allocation",              // BadAllocation
+    "epoll create failed",         // EpollCreateFailed
+    "epoll_ctl failed",            // EpollCtlFailed
+    "eventfd create failed",       // EventFdCreateFailed
+    "eventfd read failed",         // EventFdReadFailed
+    "eventfd write failed",        // EventFdWriteFailed
+    "IO invalid entries",          // IOInvalidEntries
+    "IO mmap CQ ring failed",      // IOMmapCqFailed
+    "IO mmap SQEs failed",         // IOMmapSqesFailed
+    "IO mmap SQ ring failed",      // IOMmapSqFailed
+    "IO setup failed",             // IOSetupFailed
+    "Submission queue full",       // SQFull
 };
 
 constexpr std::string_view to_string(ErrorStatus status) {

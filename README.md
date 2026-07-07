@@ -1,11 +1,11 @@
+# SlimCommonIo
+
 <a href="https://codeberg.org/greergan/SlimTS">
   <img src="https://raw.githubusercontent.com/greergan/SlimTS/master/assets/slimts_logo.png" width="75" alt="SlimTS Logo">
 </a>
 
-# SlimCommonIo
-
 A low-level, Linux-native async I/O runtime built directly on `io_uring`.  
-Provides coroutine-based I/O operations, a cooperative task scheduler, and a thin ring-management layer with no external userspace dependencies.  
+Provides coroutine-based I/O operations, a cooperative task scheduler with cross-thread posting, and a thin ring-management layer with no external userspace dependencies.  
 Part of the [SlimCommon](https://codeberg.org/greergan/SlimCommon) library.  
 Built using [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).  
 CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).
@@ -34,8 +34,8 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 - Manual SQ and CQ ring setup with `mmap`, including `IORING_FEAT_SINGLE_MMAP` optimization
 - A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
 - An `Awaitable` base that hooks directly into the coroutine awaiter protocol and stages SQEs for batched submission
-- Seven concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
-- A cooperative `Scheduler` that drives the event loop, submits staged SQEs and blocks on the kernel when the CQ is empty, and reaps completed tasks
+- Eight concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
+- A cooperative `Scheduler` that drives the event loop, submits staged SQEs and blocks on the kernel when the CQ is empty, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
 - An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
 
 [↑ Top](#table-of-contents)
@@ -51,6 +51,7 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | SQ backpressure | If the SQ is full when `Scheduler::spawn()` is called, `spawn()` throws `IOException(ErrorStatus::SQFull)` |
 | Batched submission | SQEs are staged in `await_suspend` and flushed to the kernel in a single `io_uring_enter` call at the start of each `drain()` tick |
 | Blocking drain | `Scheduler::drain()` issues `IORING_ENTER_GETEVENTS` when the CQ is empty after submission, avoiding a busy loop |
+| Cross-thread posting | `Scheduler::post(std::function<void()>)` is thread-safe; any thread (including a V8 isolate thread) can queue work onto the scheduler. An `eventfd` is checked non-blocking at the start of each `drain()` tick to drain the inbox without blocking the event loop |
 | Cooperative scheduler | `Scheduler::run()` loops drain → reap until a `std::stop_token` fires; `shutdown()` flushes all pending tasks |
 | Linux-only | Requires Linux 5.1+ (`io_uring`) and `linux/io_uring.h` kernel headers; no platform abstraction layer |
 
@@ -173,15 +174,17 @@ slim::common::IO io;
 slim::common::io::Scheduler sched(io);
 ```
 
-`Scheduler` drives the coroutine event loop. It holds a `std::vector<Task<void>>` of live tasks and an `IO&` reference. It is non-copyable.
+`Scheduler` drives the coroutine event loop. It holds a `std::vector<Task<void>>` of live tasks, an `IO&` reference, and an `eventfd` for cross-thread wakeup. It is non-copyable.
 
 | Method | Description |
 |--------|-------------|
 | `spawn(Task<T>&&)` | Resumes the task to its first suspension point, then takes ownership. Throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full, or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
+| `post(std::function<void()>)` | Thread-safe. Enqueues a callable onto the scheduler's inbox and writes to the `eventfd` to wake the event loop. Safe to call from any thread including a V8 isolate thread |
 | `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled |
 | `shutdown()` | Flushes all remaining tasks by looping `drain()` → `reap()` until the task list is empty. Called automatically by the destructor if tasks remain |
+| `eventfd()` | Returns the scheduler's `eventfd` file descriptor. Exposed for advanced use cases |
 
-**`drain()`** — first submits all SQEs staged since the last tick via a single `io_uring_enter` call, then processes all available CQEs. If the CQ is still empty after submission it blocks in the kernel via `IORING_ENTER_GETEVENTS` until at least one event arrives, then resumes the associated coroutine for each CQE. The CQ head is advanced in a single batch store after all CQEs in the snapshot are processed.
+**`drain()`** — first checks the `eventfd` non-blocking and drains the inbox if the flag is set, then submits all SQEs staged since the last tick via a single `io_uring_enter` call, then processes all available CQEs. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in the kernel via `IORING_ENTER_GETEVENTS` until at least one event arrives, then resumes the associated coroutine for each CQE. The CQ head is advanced after each CQE.
 
 **`reap()`** — sweeps `tasks_` and erases completed entries. Currently O(n); an intrusive list is the recommended optimization for high-IOPS paths.
 
@@ -203,6 +206,9 @@ Constructor failures on `IO` and spawn-time failures on `Scheduler` are reported
 |---------------|--------|---------|
 | `OK` | `"OK"` | No error |
 | `BadAllocation` | `"Bad allocation"` | `Scheduler::spawn()` could not grow the internal task vector |
+| `EventFdCreateFailed` | `"eventfd create failed"` | `Scheduler` could not create its wakeup `eventfd` |
+| `EventFdReadFailed` | `"eventfd read failed"` | Unexpected error reading the wakeup `eventfd` |
+| `EventFdWriteFailed` | `"eventfd write failed"` | `Scheduler::post()` could not write to the wakeup `eventfd` |
 | `IOInvalidEntries` | `"IO invalid entries"` | `IO` constructed with zero entries |
 | `IOMmapCqFailed` | `"IO mmap CQ ring failed"` | CQ ring `mmap` failed (legacy kernels without `IORING_FEAT_SINGLE_MMAP`) |
 | `IOMmapSqesFailed` | `"IO mmap SQEs failed"` | SQEs array `mmap` failed |
@@ -229,11 +235,9 @@ Requires Linux 5.1+ and kernel headers providing `linux/io_uring.h`. A C++20-cap
 ### required_packages
 
 External package dependencies for this library are declared in the [`required_packages`](required_packages) file at the repository root. This file is read by [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager) during the build process to resolve dependencies and install them if not present.
-
 ```
 none
 ```
-
 [↑ Top](#table-of-contents)
 
 ## Examples
@@ -262,7 +266,8 @@ auto read_file = [&]() -> slim::common::io::Task<void> {
 };
 
 slim::common::io::Scheduler sched(io);
-sched.spawn(read_file());
+auto coro = read_file();
+sched.spawn(std::move(coro));
 sched.shutdown();
 ```
 
@@ -285,8 +290,22 @@ auto accept_loop = [&]() -> slim::common::io::Task<void> {
 };
 
 slim::common::io::Scheduler sched(io);
-sched.spawn(accept_loop());
+auto coro = accept_loop();
+sched.spawn(std::move(coro));
 sched.run(stop.get_token()); // blocks until stop.request_stop()
+```
+
+```cpp
+// Post work from another thread (e.g. a V8 isolate thread)
+sched.post([&]() {
+    // runs on the scheduler thread during the next drain() tick
+    auto send = [&]() -> slim::common::io::Task<void> {
+        slim::common::io::Send s(io, client_fd, "pushed\n", 7);
+        co_await s;
+    };
+    auto coro = send();
+    sched.spawn(std::move(coro));
+});
 ```
 
 ```cpp

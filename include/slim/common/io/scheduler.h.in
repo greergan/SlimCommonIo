@@ -1,26 +1,55 @@
 #pragma once
-#include <new>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include <stop_token>
 #include <vector>
+#include <queue>
+#include <mutex>
+#include <functional>
 #include <slim/common/io.h>
 #include <slim/common/io/awaitable.h>
 #include <slim/common/io/error_codes.h>
 #include <slim/common/io/task.h>
+
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
 namespace slim::common::io {
+
 class Scheduler {
 public:
     explicit Scheduler(IO& io_ref);
     ~Scheduler();
+
     Scheduler(const Scheduler&)            = delete;
     Scheduler& operator=(const Scheduler&) = delete;
+
     template <typename T>
     void spawn(Task<T>&& task) {
+        // Check there is room for at least the first SQE this task will
+        // need BEFORE ever calling resume(). A coroutine starts
+        // suspended at its initial-suspend point, so nothing has
+        // executed yet at this check -- if we resumed anyway while the
+        // ring is full, await_suspend()'s SQFull side-channel would not
+        // actually pause the coroutine (returning false from
+        // await_suspend resumes immediately per the language rules,
+        // with the awaited result left at its default 0), and it would
+        // race straight through every subsequent stage with garbage
+        // results before we ever got a chance to detect the error.
+        // Throwing here instead, strictly pre-resume, keeps the
+        // documented "spawn() throws on a full queue" contract while
+        // guaranteeing the throw always happens before any user code in
+        // the task has run -- so callers (e.g. drain_inbox()) can retry
+        // by re-invoking their original factory call with zero risk of
+        // duplicating work.
+        uint32_t head = io_.sq.head->load(std::memory_order_acquire);
+        uint32_t tail = io_.sq.tail->load(std::memory_order_relaxed);
+        if (tail - head >= *io_.sq.entries)
+            throw IOException(ErrorStatus::SQFull);
+
         auto handle = task.handle();
         handle.resume();
-        // await_suspend() cannot throw through resume() — the coroutine ABI
-        // swallows it. Read the side-channel instead.
         if (IOException* err = take_pending_sq_error())
             throw *err;
         try {
@@ -29,12 +58,31 @@ public:
             throw IOException(ErrorStatus::BadAllocation);
         }
     }
+
+    // Thread-safe — callable from any thread including V8
+    void post(std::function<void()> task);
+
     void run(std::stop_token stop_token);
     void shutdown();
+
+    int eventfd() const noexcept { return eventfd_; }
+
 private:
-    std::vector<Task<void>> tasks_;
-    IO&                     io_;
+    IO&                               io_;
+    int                               eventfd_{-1};
+    // epoll instance watching both eventfd_ (new post()ed work) and
+    // io_.fd (CQEs ready). Needed because io_uring_enter's GETEVENTS wait
+    // only wakes on completions -- it will never notice a post() arriving
+    // while the ring is idle, so drain() must block on both fds together.
+    int                               epoll_fd_{-1};
+    bool                              shutting_down_{false};
+    std::vector<Task<void>>           tasks_;
+    std::queue<std::function<void()>> inbox_;
+    std::mutex                        inbox_mutex_;
+
+    void drain_inbox();
     void drain();
     void reap();
 };
+
 } // namespace slim::common::io
