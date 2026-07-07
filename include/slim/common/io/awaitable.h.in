@@ -8,6 +8,7 @@
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
 namespace slim::common::io {
+class Scheduler;
 // Side-channel read by spawn() after handle.resume() to detect SQFull.
 // Returns a pointer to a thread-local IOException if await_suspend() found
 // the SQ full; nullptr otherwise. Clears the flag on read.
@@ -16,7 +17,7 @@ class Awaitable {
 public:
     int                     result{0};
     std::coroutine_handle<> handle{};
-    explicit Awaitable(IO& io_ref);
+    explicit Awaitable(Scheduler& scheduler);
     virtual ~Awaitable() = default;
     bool await_ready()  const noexcept;
     bool await_suspend(std::coroutine_handle<> h);

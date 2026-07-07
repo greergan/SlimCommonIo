@@ -11,12 +11,14 @@
 
 namespace slim::common::io {
 
+class Scheduler;
+
 struct Accept : Awaitable {
     int              server_fd;
     sockaddr_storage addr{};
     socklen_t        addr_len{sizeof(addr)};
 
-    Accept(IO& io, int server_fd);
+    Accept(Scheduler& scheduler, int server_fd);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -25,7 +27,7 @@ protected:
 struct Close : Awaitable {
     int fd;
 
-    Close(IO& io, int fd);
+    Close(Scheduler& scheduler, int fd);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -37,7 +39,7 @@ struct Open : Awaitable {
     int         flags;
     mode_t      mode;
 
-    Open(IO& io, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD);
+    Open(Scheduler& scheduler, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -49,7 +51,7 @@ struct Read : Awaitable {
     size_t   len;
     uint64_t offset;
 
-    Read(IO& io_ref, int fd_, void* buf, size_t len, uint64_t offset = 0);
+    Read(Scheduler& scheduler, int fd_, void* buf, size_t len, uint64_t offset = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -61,7 +63,7 @@ struct Recv : Awaitable {
     size_t len;
     int    flags;
 
-    Recv(IO& io_ref, int fd_, void* buf, size_t len, int flags = 0);
+    Recv(Scheduler& scheduler, int fd_, void* buf, size_t len, int flags = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -73,7 +75,7 @@ struct Send : Awaitable {
     size_t      len;
     int         flags;
 
-    Send(IO& io_ref, int fd_, const void* buf, size_t len, int flags = 0);
+    Send(Scheduler& scheduler, int fd_, const void* buf, size_t len, int flags = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -86,7 +88,7 @@ struct Stat : Awaitable {
     int          flags;
     uint32_t     mask;
 
-    Stat(IO& io_ref, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd_ = AT_FDCWD);
+    Stat(Scheduler& scheduler, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd_ = AT_FDCWD);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -98,7 +100,7 @@ struct Write : Awaitable {
     size_t      len;
     uint64_t    offset;
 
-    Write(IO& io_ref, int fd_, const void* buf, size_t len, uint64_t offset = 0);
+    Write(Scheduler& scheduler, int fd_, const void* buf, size_t len, uint64_t offset = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;

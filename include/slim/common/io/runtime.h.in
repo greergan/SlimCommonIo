@@ -59,8 +59,10 @@ public:
 
     // Thread-safe hand-off point, same shape as the test: post a job to
     // the dispatcher, which (on its own thread) round-robins it to one
-    // worker's post()/spawn().
-    void post(std::function<void(IO& worker_io, Scheduler& worker_scheduler, size_t worker_idx)> job);
+    // worker's post()/spawn(). Workers never receive the IO ring
+    // directly -- Scheduler::io() is the only way to reach it, and
+    // ordinary jobs shouldn't need to.
+    void post(std::function<void(Scheduler& worker_scheduler, size_t worker_idx)> job);
 
     Scheduler& dispatcher_scheduler() noexcept { return dispatcher_; }
     WorkerNode& worker(size_t idx) noexcept { return *workers_[idx]; }

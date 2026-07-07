@@ -66,6 +66,7 @@ public:
     void shutdown();
 
     int eventfd() const noexcept { return eventfd_; }
+    IO& io() noexcept { return io_; }
 
 private:
     IO&                               io_;
