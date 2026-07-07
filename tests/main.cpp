@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <stop_token>
 #include <thread>
+#include <cstring>
+#include <vector>
 #include <slim/common/io.h>
 #include <slim/common/io/awaitable.h>
 #include <slim/common/io/error_codes.h>
@@ -534,19 +536,22 @@ TEST_CASE("Read and Write", "[io][operations]") {
         int       fd     = ::mkstemp(path);
         REQUIRE(fd >= 0);
 
-        int  written{0}, read_bytes{0};
-        char read_buf[16]{};
+        std::vector<uint32_t> write_buf(2); // 8 bytes: "testdata"
+        std::memcpy(write_buf.data(), "testdata", 8);
+        std::vector<uint32_t> read_buf(4); // 16-byte read buffer
+
+        int written{0}, read_bytes{0};
 
         auto coro = [&]() -> Task<void> {
-            written    = co_await Write{sched, fd, "testdata", 8, 0};
-            read_bytes = co_await Read{sched, fd, read_buf, sizeof(read_buf), 0};
+            written    = co_await Write{sched, fd, write_buf, 0};
+            read_bytes = co_await Read{sched, fd, read_buf, 0};
         };
         sched.spawn(coro());
         sched.shutdown();
 
         REQUIRE(written == 8);
         REQUIRE(read_bytes == 8);
-        REQUIRE(std::string_view(read_buf, 8) == "testdata");
+        REQUIRE(std::memcmp(read_buf.data(), "testdata", 8) == 0);
         ::close(fd);
         ::unlink(path);
     }
@@ -554,10 +559,10 @@ TEST_CASE("Read and Write", "[io][operations]") {
     SECTION("read returns negative errno on bad fd") {
         IO        io;
         Scheduler sched{io};
-        char      buf[4]{};
+        std::vector<uint32_t> buf(1);
         int       result{0};
 
-        auto coro = [&]() -> Task<void> { result = co_await Read{sched, -1, buf, sizeof(buf)}; };
+        auto coro = [&]() -> Task<void> { result = co_await Read{sched, -1, buf}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -567,9 +572,10 @@ TEST_CASE("Read and Write", "[io][operations]") {
     SECTION("write returns negative errno on bad fd") {
         IO        io;
         Scheduler sched{io};
+        std::vector<uint32_t> buf{0};
         int       result{0};
 
-        auto coro = [&]() -> Task<void> { result = co_await Write{sched, -1, "x", 1}; };
+        auto coro = [&]() -> Task<void> { result = co_await Write{sched, -1, buf}; };
         sched.spawn(coro());
         sched.shutdown();
 

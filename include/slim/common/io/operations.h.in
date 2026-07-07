@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <cstdint>
+#include <span>
 #include <linux/io_uring.h>
 #include <slim/common/io/awaitable.h>
 
@@ -46,12 +47,11 @@ protected:
 };
 
 struct Read : Awaitable {
-    int      fd;
-    void*    buf;
-    size_t   len;
-    uint64_t offset;
+    int                  fd;
+    std::span<uint32_t>  buf;
+    uint64_t             offset;
 
-    Read(Scheduler& scheduler, int fd_, void* buf, size_t len, uint64_t offset = 0);
+    Read(Scheduler& scheduler, int fd_, std::span<uint32_t> buf, uint64_t offset = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
@@ -95,12 +95,11 @@ protected:
 };
 
 struct Write : Awaitable {
-    int         fd;
-    const void* buf;
-    size_t      len;
-    uint64_t    offset;
+    int                        fd;
+    std::span<const uint32_t>  buf;
+    uint64_t                   offset;
 
-    Write(Scheduler& scheduler, int fd_, const void* buf, size_t len, uint64_t offset = 0);
+    Write(Scheduler& scheduler, int fd_, std::span<const uint32_t> buf, uint64_t offset = 0);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;

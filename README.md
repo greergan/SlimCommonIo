@@ -67,8 +67,8 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 |-------------------|---------|-------|
 | `IO::IO(entries)` | `256` | SQ ring depth; CQ is always twice this size to prevent overflow |
 | `IO::fd` | `-1` | Set to the live `io_uring` fd on successful construction |
-| `Read::offset` | `0` | Byte offset into the file; pass explicitly for positioned reads |
-| `Write::offset` | `0` | Byte offset into the file; pass explicitly for positioned writes |
+| `Read::offset` | `0` | Byte offset into the file; pass explicitly for positioned reads. Length is derived from the `std::span<uint32_t>` buffer — no separate size parameter |
+| `Write::offset` | `0` | Byte offset into the file; pass explicitly for positioned writes. Length is derived from the `std::span<const uint32_t>` buffer — no separate size parameter |
 | `Open::mode` | `0644` | File creation mode; ignored when flags do not include `O_CREAT` |
 | `Open::dfd` | `AT_FDCWD` | Directory fd for relative path resolution |
 | `Stat::dfd` | `AT_FDCWD` | Directory fd for relative path resolution |
@@ -157,18 +157,18 @@ protected:
 
 ### Operations
 
-All operations live in `slim::common::io` and derive from `Awaitable`. Each constructor takes a `Scheduler&` — not an `IO&` — so operations can be constructed anywhere a `Scheduler&` is in scope, including inside jobs dispatched to worker threads that never see the underlying `IO` ring. All return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall), or a negative errno on failure.
+All operations live in `slim::common::io` and derive from `Awaitable`. Each constructor takes a `Scheduler&` — not an `IO&` — so operations can be constructed anywhere a `Scheduler&` is in scope, including inside jobs dispatched to worker threads that never see the underlying `IO` ring. `Read` and `Write` take a `std::span` over `uint32_t` storage rather than a separate `(void*, size_t)` pair — the buffer supplies its own length, so a `std::vector<uint32_t>` (or any contiguous `uint32_t` container) can be passed directly with no explicit size argument. All operations return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall — `Read`/`Write` yield the raw byte count from the kernel, not an element count), or a negative errno on failure.
 
 | Operation | Constructor | `io_uring` opcode | Notes |
 |-----------|-------------|-------------------|-------|
 | `Accept` | `Accept(Scheduler&, int server_fd)` | `IORING_OP_ACCEPT` | Yields the accepted client fd. Socket created with `SOCK_NONBLOCK \| SOCK_CLOEXEC`. Peer address available via `addr` / `addr_len` members |
 | `Close` | `Close(Scheduler&, int fd)` | `IORING_OP_CLOSE` | Async fd close |
 | `Open` | `Open(Scheduler&, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD)` | `IORING_OP_OPENAT` | Yields the opened fd on success |
-| `Read` | `Read(Scheduler&, int fd, void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_READ` | Yields bytes read |
+| `Read` | `Read(Scheduler&, int fd, std::span<uint32_t> buf, uint64_t offset = 0)` | `IORING_OP_READ` | Yields bytes read (raw kernel byte count, not divided by `sizeof(uint32_t)`) |
 | `Recv` | `Recv(Scheduler&, int fd, void* buf, size_t len, int flags = 0)` | `IORING_OP_RECV` | Yields bytes received |
 | `Send` | `Send(Scheduler&, int fd, const void* buf, size_t len, int flags = 0)` | `IORING_OP_SEND` | Yields bytes sent |
 | `Stat` | `Stat(Scheduler&, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd = AT_FDCWD)` | `IORING_OP_STATX` | Result in `buf` member (`struct statx`) on success |
-| `Write` | `Write(Scheduler&, int fd, const void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_WRITE` | Yields bytes written |
+| `Write` | `Write(Scheduler&, int fd, std::span<const uint32_t> buf, uint64_t offset = 0)` | `IORING_OP_WRITE` | Yields bytes written (raw kernel byte count, not divided by `sizeof(uint32_t)`) |
 
 [↑ Top](#table-of-contents)
 
@@ -279,105 +279,107 @@ none
 ## Examples
 
 ```cpp
-// Construct the io_uring instance (256-entry SQ, 512-entry CQ)
-slim::common::IO io;
-
-// Or with a custom ring depth
-slim::common::IO io(512);
-```
-
-```cpp
-// Read a file asynchronously
-slim::common::io::Scheduler sched(io);
-
-auto read_file = [&]() -> slim::common::io::Task<void> {
-    slim::common::io::Open open(sched, "/etc/hostname", O_RDONLY);
-    int fd = co_await open;
-    if (fd < 0) co_return;
-
-    char buf[256]{};
-    slim::common::io::Read read(sched, fd, buf, sizeof(buf));
-    int n = co_await read;
-
-    slim::common::io::Close close(sched, fd);
-    co_await close;
-};
-
-auto coro = read_file();
-sched.spawn(std::move(coro));
-sched.shutdown();
-```
-
-```cpp
-// Accept loop — serve connections until stopped
-std::stop_source stop;
-slim::common::io::Scheduler sched(io);
-
-auto accept_loop = [&]() -> slim::common::io::Task<void> {
-    while (true) {
-        slim::common::io::Accept accept(sched, server_fd);
-        int client_fd = co_await accept;
-        if (client_fd < 0) break;
-
-        slim::common::io::Send send(sched, client_fd, "hello\n", 6);
-        co_await send;
-
-        slim::common::io::Close close(sched, client_fd);
-        co_await close;
-    }
-};
-
-auto coro = accept_loop();
-sched.spawn(std::move(coro));
-sched.run(stop.get_token()); // blocks until stop.request_stop()
-```
-
-```cpp
-// Post work from another thread (e.g. a V8 isolate thread)
-sched.post([&]() {
-    // runs on the scheduler thread during the next drain() tick
-    auto send = [&]() -> slim::common::io::Task<void> {
-        slim::common::io::Send s(sched, client_fd, "pushed\n", 7);
-        co_await s;
-    };
-    auto coro = send();
-    sched.spawn(std::move(coro));
-});
-```
-
-```cpp
-// Use Runtime for a multi-threaded dispatcher/worker setup.
-// Jobs only ever see the worker's Scheduler& — the IO ring stays
-// encapsulated inside the WorkerNode.
-slim::common::io::Runtime rt(4); // 4 workers
+// Construct a Runtime — 4 worker threads, 256-entry rings.
+// Runtime owns every IO ring internally (one per worker, one for the
+// dispatcher); nothing outside Runtime/Scheduler ever touches IO directly.
+slim::common::io::Runtime rt(4);
 rt.start();
+```
 
+```cpp
+// Open/write/read/close a file inside a job dispatched to a worker.
+// Read/Write take their buffer as a std::span<uint32_t>
+// (std::span<const uint32_t> for Write), so a std::vector<uint32_t> can be
+// passed with no separate size argument — the buffer's own size() supplies
+// the length.
 rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
     auto job = [&sched]() -> slim::common::io::Task<void> {
-        char buf[256]{};
-        slim::common::io::Read read(sched, some_fd, buf, sizeof(buf));
-        int n = co_await read;
-        // handle result
+        slim::common::io::Open open(sched, "/tmp/example.dat", O_CREAT | O_WRONLY | O_TRUNC);
+        int fd = co_await open;
+        if (fd < 0) co_return;
+
+        std::vector<uint32_t> write_buf{0x11111111, 0x22222222, 0x33333333};
+        slim::common::io::Write write(sched, fd, write_buf); // 12 bytes, no explicit length
+        int written = co_await write;                        // raw byte count from the kernel
+
+        slim::common::io::Close close(sched, fd);
+        co_await close;
+
+        int reopen_fd = co_await slim::common::io::Open(sched, "/tmp/example.dat", O_RDONLY);
+        if (reopen_fd < 0) co_return;
+
+        std::vector<uint32_t> read_buf(3);
+        slim::common::io::Read read(sched, reopen_fd, read_buf); // fills up to read_buf.size() * 4 bytes
+        int n = co_await read;                                   // also a raw byte count
+
+        slim::common::io::Close close2(sched, reopen_fd);
+        co_await close2;
     };
     auto coro = job();
     sched.spawn(std::move(coro));
 });
+```
 
+```cpp
+// Accept loop — serve connections on a worker until Runtime stops it.
+// A worker's Scheduler::shutdown() (invoked internally by Runtime::stop())
+// flushes pending tasks, so the loop coroutine doesn't need its own
+// stop_token — it simply runs until the worker scheduler is torn down.
+rt.post([server_fd](slim::common::io::Scheduler& sched, size_t idx) {
+    auto accept_loop = [&sched, server_fd]() -> slim::common::io::Task<void> {
+        while (true) {
+            slim::common::io::Accept accept(sched, server_fd);
+            int client_fd = co_await accept;
+            if (client_fd < 0) break;
+
+            slim::common::io::Send send(sched, client_fd, "hello\n", 6);
+            co_await send;
+
+            slim::common::io::Close close(sched, client_fd);
+            co_await close;
+        }
+    };
+    auto coro = accept_loop();
+    sched.spawn(std::move(coro));
+});
+```
+
+```cpp
+// rt.post() is itself the thread-safe hand-off point — call it from any
+// thread (including a V8 isolate thread) to enqueue work on a worker.
+std::thread producer([&rt, client_fd]() {
+    rt.post([client_fd](slim::common::io::Scheduler& sched, size_t idx) {
+        auto send = [&sched, client_fd]() -> slim::common::io::Task<void> {
+            slim::common::io::Send s(sched, client_fd, "pushed\n", 7);
+            co_await s;
+        };
+        auto coro = send();
+        sched.spawn(std::move(coro));
+    });
+});
+producer.join();
+```
+
+```cpp
+// Stop the runtime: signals dispatcher + all workers, joins their
+// threads, and shuts down every scheduler.
 rt.stop();
 ```
 
 ```cpp
-// Handle IOException from IO or Scheduler construction
+// Handle IOException from Runtime construction (ring/scheduler setup
+// failures on the dispatcher or any worker surface here)
 try {
-    slim::common::IO io(1024);
-    slim::common::io::Scheduler sched(io);
-    // use sched ...
+    slim::common::io::Runtime rt(4);
+    rt.start();
+    // use rt ...
+    rt.stop();
 }
 catch (const slim::common::io::IOException& e) {
     std::cerr << "setup failed: " << e.what() << '\n';
     // e.status() is one of ErrorStatus::IOSetupFailed,
     // ErrorStatus::EpollCreateFailed, ErrorStatus::EpollCtlFailed,
-    // ErrorStatus::EventFdCreateFailed, etc.
+    // ErrorStatus::EventFdCreateFailed, ErrorStatus::RuntimeNotIdle, etc.
 }
 ```
 

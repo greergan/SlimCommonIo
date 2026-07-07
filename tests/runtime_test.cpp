@@ -66,8 +66,8 @@ Task<void> read_one_file_on_worker(Scheduler& scheduler, std::string path, PerWo
     int fd = co_await open_op;
 
     if (fd >= 0) {
-        char buf[4096];
-        Read read_op(scheduler, fd, buf, sizeof(buf));
+        std::vector<uint32_t> buf(4096 / sizeof(uint32_t));
+        Read read_op(scheduler, fd, buf);
         int n = co_await read_op;
         if (n >= 0) {
             stats.succeeded[worker_idx].fetch_add(1, std::memory_order_relaxed);

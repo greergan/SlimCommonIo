@@ -33,14 +33,14 @@ using slim::common::io::Write;
 
 namespace {
 
-constexpr size_t kBufSize = 4096;
+constexpr size_t kBufSize = 4096; // bytes
 
-Task<void> write_random_file(Scheduler& scheduler, std::string path, std::vector<uint8_t> data, std::atomic<int>& completed) {
+Task<void> write_random_file(Scheduler& scheduler, std::string path, std::vector<uint32_t> data, std::atomic<int>& completed) {
     Open open_op(scheduler, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
     int fd = co_await open_op;
 
     if (fd >= 0) {
-        Write write_op(scheduler, fd, data.data(), data.size());
+        Write write_op(scheduler, fd, data);
         co_await write_op;
 
         Close close_op(scheduler, fd);
@@ -56,11 +56,11 @@ Task<void> write_random_file(Scheduler& scheduler, std::string path, std::vector
 TEST_CASE("Runtime writes random data to a file in /tmp", "[runtime][write]") {
     const std::string path = "/tmp/slim_io_runtime_write_test_" + std::to_string(getpid());
 
-    // Generate 4KB of random data with a seeded PRNG.
+    // Generate 4KB of random data with a seeded PRNG, one uint32_t at a time.
     std::mt19937                          rng(12345);
     std::uniform_int_distribution<int>    dist(0, 255);
-    std::vector<uint8_t>                  data(kBufSize);
-    for (auto& byte : data) byte = static_cast<uint8_t>(dist(rng));
+    std::vector<uint32_t>                 data(kBufSize / sizeof(uint32_t));
+    for (auto& word : data) word = static_cast<uint32_t>(dist(rng));
 
     Runtime runtime(1);
     runtime.start();
@@ -96,22 +96,22 @@ TEST_CASE("Runtime writes random data to a file in /tmp", "[runtime][write]") {
 
 TEST_CASE("Runtime writes random data to per-worker files with multiple workers", "[runtime][write][multithread]") {
     constexpr size_t kNumWorkers  = 8;
-    constexpr size_t kFileSize    = 1024 * 1024; // 1MB per worker
+    constexpr size_t kFileSize    = 1024 * 1024; // 1MB per worker, in bytes
 
     Runtime runtime(kNumWorkers);
     runtime.start();
 
-    std::vector<std::string>          paths(kNumWorkers);
-    std::vector<std::vector<uint8_t>> datas(kNumWorkers);
-    std::atomic<int>                  completed{0};
+    std::vector<std::string>           paths(kNumWorkers);
+    std::vector<std::vector<uint32_t>> datas(kNumWorkers);
+    std::atomic<int>                   completed{0};
 
     std::mt19937                       rng(67890);
     std::uniform_int_distribution<int> dist(0, 255);
 
     for (size_t i = 0; i < kNumWorkers; ++i) {
         paths[i] = "/tmp/slim_io_runtime_write_test_" + std::to_string(getpid()) + "_w" + std::to_string(i);
-        datas[i].resize(kFileSize);
-        for (auto& byte : datas[i]) byte = static_cast<uint8_t>(dist(rng));
+        datas[i].resize(kFileSize / sizeof(uint32_t));
+        for (auto& word : datas[i]) word = static_cast<uint32_t>(dist(rng));
     }
 
     for (size_t i = 0; i < kNumWorkers; ++i) {
@@ -153,14 +153,14 @@ TEST_CASE("Runtime writes random data to per-worker files with multiple workers"
 
 namespace {
 
-Task<void> write_random_sized_file(Scheduler& scheduler, std::string path, std::vector<uint8_t> data, size_t job_idx,
+Task<void> write_random_sized_file(Scheduler& scheduler, std::string path, std::vector<uint32_t> data, size_t job_idx,
                                     std::atomic<int>& order_counter, std::vector<int>& completion_order,
                                     std::atomic<int>& completed) {
     Open open_op(scheduler, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
     int fd = co_await open_op;
 
     if (fd >= 0) {
-        Write write_op(scheduler, fd, data.data(), data.size());
+        Write write_op(scheduler, fd, data);
         co_await write_op;
 
         Close close_op(scheduler, fd);
@@ -177,22 +177,24 @@ Task<void> write_random_sized_file(Scheduler& scheduler, std::string path, std::
 TEST_CASE("Runtime handles jobs with random write sizes that may complete out of order", "[runtime][timing]") {
     constexpr size_t kNumJobs    = 8;
     constexpr size_t kNumWorkers = 4;
-    constexpr size_t kMinSize    = 1024 * 1024;
-    constexpr size_t kMaxSize    = 100 * 1024 * 1024;
+    // Sizes expressed in uint32_t elements so buf.size() * sizeof(uint32_t)
+    // lands on an exact byte count with no truncation.
+    constexpr size_t kMinElems   = (1024 * 1024) / sizeof(uint32_t);
+    constexpr size_t kMaxElems   = (100 * 1024 * 1024) / sizeof(uint32_t);
 
     Runtime runtime(kNumWorkers);
     runtime.start();
 
-    std::mt19937                        rng(13579);
-    std::uniform_int_distribution<size_t> size_dist(kMinSize, kMaxSize);
-    std::uniform_int_distribution<int>    byte_dist(0, 255);
+    std::mt19937                          rng(13579);
+    std::uniform_int_distribution<size_t> size_dist(kMinElems, kMaxElems);
+    std::uniform_int_distribution<int>    word_dist(0, 255);
 
-    std::vector<std::string>          paths(kNumJobs);
-    std::vector<std::vector<uint8_t>> datas(kNumJobs);
+    std::vector<std::string>           paths(kNumJobs);
+    std::vector<std::vector<uint32_t>> datas(kNumJobs);
     for (size_t i = 0; i < kNumJobs; ++i) {
         paths[i] = "/tmp/slim_io_runtime_order_test_" + std::to_string(getpid()) + "_j" + std::to_string(i);
         datas[i].resize(size_dist(rng));
-        for (auto& b : datas[i]) b = static_cast<uint8_t>(byte_dist(rng));
+        for (auto& w : datas[i]) w = static_cast<uint32_t>(word_dist(rng));
     }
 
     std::atomic<int> order_counter{0};
@@ -221,17 +223,19 @@ TEST_CASE("Runtime handles jobs with random write sizes that may complete out of
     // visible on every run, not just on failure or with -s.
     std::cerr << "job_idx | size (bytes) | completion_order\n";
     for (size_t i = 0; i < kNumJobs; ++i) {
-        std::cerr << i << " | " << datas[i].size() << " | " << completion_order[i] << "\n";
+        std::cerr << i << " | " << (datas[i].size() * sizeof(uint32_t)) << " | " << completion_order[i] << "\n";
     }
     std::cerr << std::flush;
 
     for (size_t i = 0; i < kNumJobs; ++i) {
         CHECK(completion_order[i] >= 0);
 
+        const size_t expected_bytes = datas[i].size() * sizeof(uint32_t);
+
         int fd = ::open(paths[i].c_str(), O_RDONLY);
         REQUIRE(fd >= 0);
 
-        std::vector<uint8_t> read_back(datas[i].size());
+        std::vector<uint8_t> read_back(expected_bytes);
         size_t               total_read = 0;
         while (total_read < read_back.size()) {
             ssize_t n = ::read(fd, read_back.data() + total_read, read_back.size() - total_read);
@@ -240,8 +244,8 @@ TEST_CASE("Runtime handles jobs with random write sizes that may complete out of
         }
         ::close(fd);
 
-        CHECK(total_read == datas[i].size());
-        CHECK(std::memcmp(datas[i].data(), read_back.data(), datas[i].size()) == 0);
+        CHECK(total_read == expected_bytes);
+        CHECK(std::memcmp(datas[i].data(), read_back.data(), expected_bytes) == 0);
 
         ::unlink(paths[i].c_str());
     }

@@ -42,15 +42,15 @@ void Open::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Read ───────────────────────────────────────────────────────────────────
 
-Read::Read(Scheduler& scheduler, int fd_, void* buf_, size_t len_, uint64_t offset_)
-    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
+Read::Read(Scheduler& scheduler, int fd_, std::span<uint32_t> buf_, uint64_t offset_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), offset(offset_) {}
 
 void Read::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_READ;
     sqe->fd     = fd;
-    sqe->addr   = reinterpret_cast<uint64_t>(buf);
-    sqe->len    = static_cast<uint32_t>(len);
+    sqe->addr   = reinterpret_cast<uint64_t>(buf.data());
+    sqe->len    = static_cast<uint32_t>(buf.size() * sizeof(uint32_t));
     sqe->off    = offset;
 }
 
@@ -99,15 +99,15 @@ void Stat::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Write ──────────────────────────────────────────────────────────────────
 
-Write::Write(Scheduler& scheduler, int fd_, const void* buf_, size_t len_, uint64_t offset_)
-    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
+Write::Write(Scheduler& scheduler, int fd_, std::span<const uint32_t> buf_, uint64_t offset_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), offset(offset_) {}
 
 void Write::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_WRITE;
     sqe->fd     = fd;
-    sqe->addr   = reinterpret_cast<uint64_t>(buf);
-    sqe->len    = static_cast<uint32_t>(len);
+    sqe->addr   = reinterpret_cast<uint64_t>(buf.data());
+    sqe->len    = static_cast<uint32_t>(buf.size() * sizeof(uint32_t));
     sqe->off    = offset;
 }
 
