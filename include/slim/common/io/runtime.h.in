@@ -1,0 +1,83 @@
+#pragma once
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <stop_token>
+#include <thread>
+#include <vector>
+
+#include <slim/common/io.h>
+#include <slim/common/io/scheduler.h>
+
+#define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
+#define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
+namespace slim::common::io {
+
+// Owns one dispatcher IO ring/Scheduler/thread and N worker IO
+// ring/Scheduler/thread units. Mirrors the structure already exercised
+// by the "One scheduler hands off work to multiple worker schedulers"
+// test: the dispatcher does no file I/O itself, it just receives
+// post()ed work and round-robins it out to a worker's post()/spawn().
+class Runtime {
+public:
+    // A worker owns its own io_uring ring, its own Scheduler, and the
+    // thread that drives that scheduler's event loop.
+    struct WorkerNode {
+        IO               io;
+        Scheduler        scheduler{io};
+        std::stop_source stop_src{};
+        std::jthread     runner;
+
+        WorkerNode() : runner([this](std::stop_token) { scheduler.run(stop_src.get_token()); }) {}
+
+        void stop_and_join() {
+            stop_src.request_stop();
+            if (runner.joinable()) runner.join();
+            scheduler.shutdown();
+        }
+    };
+
+    explicit Runtime(size_t worker_count, uint32_t entries = 256);
+    ~Runtime();
+
+    Runtime(const Runtime&)            = delete;
+    Runtime& operator=(const Runtime&) = delete;
+    Runtime(Runtime&&)                 = delete;
+    Runtime& operator=(Runtime&&)      = delete;
+
+    // Starts the dispatcher thread. Worker threads are already running
+    // (started in each WorkerNode's constructor), matching the existing
+    // test's behavior.
+    void start();
+
+    // Requests dispatcher + all worker threads to stop, joins them, and
+    // shuts down every Scheduler. Safe to call more than once.
+    void stop();
+
+    // Thread-safe hand-off point, same shape as the test: post a job to
+    // the dispatcher, which (on its own thread) round-robins it to one
+    // worker's post()/spawn().
+    void post(std::function<void(IO& worker_io, Scheduler& worker_scheduler, size_t worker_idx)> job);
+
+    Scheduler& dispatcher_scheduler() noexcept { return dispatcher_; }
+    WorkerNode& worker(size_t idx) noexcept { return *workers_[idx]; }
+    size_t worker_count() const noexcept { return workers_.size(); }
+
+private:
+    enum class State { Idle, Running, Stopped };
+
+    IO        dispatcher_io_;
+    Scheduler dispatcher_;
+    std::stop_source dispatcher_stop_src_{};
+    std::jthread      dispatcher_runner_;
+
+    std::vector<std::unique_ptr<WorkerNode>> workers_;
+    std::atomic<size_t> next_worker_{0};
+
+    State state_{State::Idle};
+};
+
+} // namespace slim::common::io

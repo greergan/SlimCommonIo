@@ -22,6 +22,7 @@ CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://co
   - [Awaitable](#awaitable)
   - [Operations](#operations)
   - [Scheduler](#scheduler)
+  - [Runtime](#runtime)
 - [Error Model](#error-model)
 - [Building](#building)
 - [Dependencies](#dependencies)
@@ -35,7 +36,8 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 - A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
 - An `Awaitable` base that hooks directly into the coroutine awaiter protocol and stages SQEs for batched submission
 - Eight concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
-- A cooperative `Scheduler` that drives the event loop, submits staged SQEs and blocks on the kernel when the CQ is empty, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
+- A cooperative `Scheduler` that drives the event loop, submits staged SQEs in batch, blocks on an `epoll` instance watching both the `io_uring` fd and an `eventfd` wakeup channel, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
+- A `Runtime` that owns one dispatcher scheduler plus N worker schedulers, each on its own thread and ring, with round-robin job dispatch
 - An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
 
 [↑ Top](#table-of-contents)
@@ -48,11 +50,12 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | Single-mmap optimization | CQ ring reuses the SQ `mmap` allocation when `IORING_FEAT_SINGLE_MMAP` is available |
 | Coroutine tasks | `Task<T>` implements the C++20 coroutine promise protocol via a `ValueStore<T>` base; always suspends at start; handles both value and `void` returns in a single template |
 | Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()` |
-| SQ backpressure | If the SQ is full when `Scheduler::spawn()` is called, `spawn()` throws `IOException(ErrorStatus::SQFull)` |
+| SQ backpressure | `Scheduler::spawn()` checks SQ capacity before calling `resume()`. If already full, it throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. A second check via a thread-local side-channel catches the case where the SQ fills mid-coroutine inside `await_suspend` |
 | Batched submission | SQEs are staged in `await_suspend` and flushed to the kernel in a single `io_uring_enter` call at the start of each `drain()` tick |
-| Blocking drain | `Scheduler::drain()` issues `IORING_ENTER_GETEVENTS` when the CQ is empty after submission, avoiding a busy loop |
-| Cross-thread posting | `Scheduler::post(std::function<void()>)` is thread-safe; any thread (including a V8 isolate thread) can queue work onto the scheduler. An `eventfd` is checked non-blocking at the start of each `drain()` tick to drain the inbox without blocking the event loop |
-| Cooperative scheduler | `Scheduler::run()` loops drain → reap until a `std::stop_token` fires; `shutdown()` flushes all pending tasks |
+| Epoll-based blocking drain | When the CQ is empty after submission, `drain()` blocks in `epoll_wait` on an epoll instance that watches both the `io_uring` fd (CQEs) and the `eventfd` (new `post()`ed work). This prevents the scheduler thread from hanging if a `post()` arrives while the ring is completely idle |
+| Cross-thread posting | `Scheduler::post(std::function<void()>)` is thread-safe; any thread (including a V8 isolate thread) can queue work onto the scheduler. An `eventfd` is written to wake the blocked event loop. If `spawn()` throws `SQFull` inside the inbox drain, the callable is re-queued and the `eventfd` is poked again so it retries on the next drain cycle |
+| Cooperative scheduler | `Scheduler::run()` loops drain → reap until a `std::stop_token` fires; a `std::stop_callback` writes to the `eventfd` to break out of any blocked `epoll_wait`. `shutdown()` flushes all pending tasks |
+| Runtime | `Runtime` owns a dispatcher IO/Scheduler/thread plus N worker IO/Scheduler/thread units. `Runtime::post()` enqueues a job onto the dispatcher, which round-robins it to a worker's `post()`/`spawn()` |
 | Linux-only | Requires Linux 5.1+ (`io_uring`) and `linux/io_uring.h` kernel headers; no platform abstraction layer |
 
 [↑ Top](#table-of-contents)
@@ -74,6 +77,7 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | `Send::flags` | `0` | `MSG_*` flags passed to the underlying `send` |
 | `Accept` socket flags | `SOCK_NONBLOCK \| SOCK_CLOEXEC` | Always applied; not overridable via the constructor |
 | `Awaitable::result` | `0` | Overwritten by the CQE result on completion |
+| `Runtime(worker_count, entries)` | entries=`256` | Each worker and the dispatcher use the same ring depth |
 
 [↑ Top](#table-of-contents)
 
@@ -174,17 +178,17 @@ slim::common::IO io;
 slim::common::io::Scheduler sched(io);
 ```
 
-`Scheduler` drives the coroutine event loop. It holds a `std::vector<Task<void>>` of live tasks, an `IO&` reference, and an `eventfd` for cross-thread wakeup. It is non-copyable.
+`Scheduler` drives the coroutine event loop. It holds a `std::vector<Task<void>>` of live tasks, an `IO&` reference, an `eventfd` for cross-thread wakeup, and an `epoll` instance that watches both the `eventfd` and the `io_uring` fd. It is non-copyable.
 
 | Method | Description |
 |--------|-------------|
-| `spawn(Task<T>&&)` | Resumes the task to its first suspension point, then takes ownership. Throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full, or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
-| `post(std::function<void()>)` | Thread-safe. Enqueues a callable onto the scheduler's inbox and writes to the `eventfd` to wake the event loop. Safe to call from any thread including a V8 isolate thread |
-| `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled |
+| `spawn(Task<T>&&)` | Checks SQ capacity before calling `resume()`. If the SQ is already full, throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. Otherwise, resumes the task to its first suspension point and takes ownership. Also throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full during that first resume, or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
+| `post(std::function<void()>)` | Thread-safe. Enqueues a callable onto the scheduler's inbox and writes to the `eventfd` to wake the event loop. Safe to call from any thread including a V8 isolate thread. If the callable throws `SQFull` inside the inbox drain, it is re-queued and the `eventfd` is poked again for a later retry |
+| `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled. A `std::stop_callback` writes to the `eventfd` to break out of any blocked `epoll_wait` immediately |
 | `shutdown()` | Flushes all remaining tasks by looping `drain()` → `reap()` until the task list is empty. Called automatically by the destructor if tasks remain |
 | `eventfd()` | Returns the scheduler's `eventfd` file descriptor. Exposed for advanced use cases |
 
-**`drain()`** — first checks the `eventfd` non-blocking and drains the inbox if the flag is set, then submits all SQEs staged since the last tick via a single `io_uring_enter` call, then processes all available CQEs. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in the kernel via `IORING_ENTER_GETEVENTS` until at least one event arrives, then resumes the associated coroutine for each CQE. The CQ head is advanced after each CQE.
+**`drain()`** — first attempts a non-blocking read of the `eventfd`; if signalled, drains the inbox. Then submits all staged SQEs via a single `io_uring_enter` call. Then processes all available CQEs, resuming the associated coroutine for each and advancing the CQ head. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in `epoll_wait(-1)` on an epoll instance watching both the `io_uring` fd and the `eventfd`, so that either a new CQE or a new `post()` will wake it. Returns after the wait without processing — the next `drain()` call from `run()`'s loop handles the new event.
 
 **`reap()`** — sweeps `tasks_` and erases completed entries. Currently O(n); an intrusive list is the recommended optimization for high-IOPS paths.
 
@@ -198,14 +202,43 @@ sched.spawn(coro());  // correct — named variable
 
 [↑ Top](#table-of-contents)
 
+### Runtime
+
+```cpp
+slim::common::io::Runtime rt(4);   // 4 worker threads, 256-entry rings
+rt.start();
+rt.post([](IO& io, Scheduler& sched, size_t idx) {
+    // runs on worker idx's thread
+});
+rt.stop();
+```
+
+`Runtime` owns one dispatcher IO/Scheduler/thread and N worker IO/Scheduler/thread units. Worker threads start immediately on construction. The dispatcher thread starts on `start()`. `Runtime` is non-copyable and non-movable.
+
+| Method | Description |
+|--------|-------------|
+| `Runtime(size_t worker_count, uint32_t entries = 256)` | Constructs the dispatcher ring/scheduler and all worker `WorkerNode`s. Worker threads start immediately. Throws `IOException` on any ring or scheduler construction failure |
+| `start()` | Starts the dispatcher thread. Throws `IOException(ErrorStatus::RuntimeNotIdle)` if called more than once or after `stop()` |
+| `stop()` | Signals the dispatcher and all workers to stop, joins their threads, and calls `shutdown()` on every scheduler. Safe to call more than once |
+| `post(job)` | Thread-safe. Posts a job to the dispatcher, which round-robins it to a worker's `post()`/`spawn()`. `job` receives `(IO& worker_io, Scheduler& worker_scheduler, size_t worker_idx)` |
+| `dispatcher_scheduler()` | Returns a reference to the dispatcher's `Scheduler` |
+| `worker(size_t idx)` | Returns a reference to the `WorkerNode` at `idx` |
+| `worker_count()` | Returns the number of worker nodes |
+
+**`WorkerNode`** — each node owns its `IO` ring, its `Scheduler`, a `std::stop_source`, and a `std::jthread` that drives the scheduler's event loop. `stop_and_join()` requests stop, joins the thread, and calls `scheduler.shutdown()`.
+
+[↑ Top](#table-of-contents)
+
 ## Error Model
 
-Constructor failures on `IO` and spawn-time failures on `Scheduler` are reported via `IOException`, a `std::runtime_error` subclass that carries an `ErrorStatus`.
+Constructor failures on `IO` and `Scheduler`, spawn-time failures on `Scheduler`, and lifecycle failures on `Runtime` are reported via `IOException`, a `std::runtime_error` subclass that carries an `ErrorStatus`.
 
 | `ErrorStatus` | String | Meaning |
 |---------------|--------|---------|
 | `OK` | `"OK"` | No error |
 | `BadAllocation` | `"Bad allocation"` | `Scheduler::spawn()` could not grow the internal task vector |
+| `EpollCreateFailed` | `"epoll create failed"` | `Scheduler` could not create its epoll instance |
+| `EpollCtlFailed` | `"epoll_ctl failed"` | `Scheduler` could not register a file descriptor with epoll |
 | `EventFdCreateFailed` | `"eventfd create failed"` | `Scheduler` could not create its wakeup `eventfd` |
 | `EventFdReadFailed` | `"eventfd read failed"` | Unexpected error reading the wakeup `eventfd` |
 | `EventFdWriteFailed` | `"eventfd write failed"` | `Scheduler::post()` could not write to the wakeup `eventfd` |
@@ -214,6 +247,7 @@ Constructor failures on `IO` and spawn-time failures on `Scheduler` are reported
 | `IOMmapSqesFailed` | `"IO mmap SQEs failed"` | SQEs array `mmap` failed |
 | `IOMmapSqFailed` | `"IO mmap SQ ring failed"` | SQ ring `mmap` failed |
 | `IOSetupFailed` | `"IO setup failed"` | `SYS_io_uring_setup` returned a negative fd |
+| `RuntimeNotIdle` | `"Runtime not idle"` | `Runtime::start()` called when the runtime is not in the idle state |
 | `SQFull` | `"Submission queue full"` | `Scheduler::spawn()` was called while every SQ slot was occupied |
 
 `IOException::status()` returns the `ErrorStatus` value. `what()` returns the corresponding string from `error_status_str[]`.
@@ -309,14 +343,36 @@ sched.post([&]() {
 ```
 
 ```cpp
-// Handle IOException from IO construction
+// Use Runtime for a multi-threaded dispatcher/worker setup
+slim::common::io::Runtime rt(4); // 4 workers
+rt.start();
+
+rt.post([](slim::common::IO& io, slim::common::io::Scheduler& sched, size_t idx) {
+    auto job = [&io]() -> slim::common::io::Task<void> {
+        char buf[256]{};
+        slim::common::io::Read read(io, some_fd, buf, sizeof(buf));
+        int n = co_await read;
+        // handle result
+    };
+    auto coro = job();
+    sched.spawn(std::move(coro));
+});
+
+rt.stop();
+```
+
+```cpp
+// Handle IOException from IO or Scheduler construction
 try {
     slim::common::IO io(1024);
-    // use io ...
+    slim::common::io::Scheduler sched(io);
+    // use sched ...
 }
 catch (const slim::common::io::IOException& e) {
-    std::cerr << "io_uring setup failed: " << e.what() << '\n';
-    // e.status() == slim::common::io::ErrorStatus::IOSetupFailed
+    std::cerr << "setup failed: " << e.what() << '\n';
+    // e.status() is one of ErrorStatus::IOSetupFailed,
+    // ErrorStatus::EpollCreateFailed, ErrorStatus::EpollCtlFailed,
+    // ErrorStatus::EventFdCreateFailed, etc.
 }
 ```
 
