@@ -23,7 +23,6 @@
 #include <unistd.h>
 #include <vector>
 
-using slim::common::IO;
 using slim::common::io::Close;
 using slim::common::io::Open;
 using slim::common::io::Read;
@@ -36,15 +35,15 @@ namespace {
 
 constexpr size_t kBufSize = 4096;
 
-Task<void> write_random_file(IO& io, std::string path, std::vector<uint8_t> data, std::atomic<int>& completed) {
-    Open open_op(io, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
+Task<void> write_random_file(Scheduler& scheduler, std::string path, std::vector<uint8_t> data, std::atomic<int>& completed) {
+    Open open_op(scheduler, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
     int fd = co_await open_op;
 
     if (fd >= 0) {
-        Write write_op(io, fd, data.data(), data.size());
+        Write write_op(scheduler, fd, data.data(), data.size());
         co_await write_op;
 
-        Close close_op(io, fd);
+        Close close_op(scheduler, fd);
         co_await close_op;
     }
 
@@ -67,8 +66,8 @@ TEST_CASE("Runtime writes random data to a file in /tmp", "[runtime][write]") {
     runtime.start();
 
     std::atomic<int> completed{0};
-    runtime.post([path, data, &completed](IO& io, Scheduler& scheduler, size_t /*worker_idx*/) {
-        scheduler.spawn(write_random_file(io, path, data, completed));
+    runtime.post([path, data, &completed](Scheduler& scheduler, size_t /*worker_idx*/) {
+        scheduler.spawn(write_random_file(scheduler, path, data, completed));
     });
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -116,8 +115,8 @@ TEST_CASE("Runtime writes random data to per-worker files with multiple workers"
     }
 
     for (size_t i = 0; i < kNumWorkers; ++i) {
-        runtime.post([path = paths[i], data = datas[i], &completed](IO& io, Scheduler& scheduler, size_t /*worker_idx*/) {
-            scheduler.spawn(write_random_file(io, path, data, completed));
+        runtime.post([path = paths[i], data = datas[i], &completed](Scheduler& scheduler, size_t /*worker_idx*/) {
+            scheduler.spawn(write_random_file(scheduler, path, data, completed));
         });
     }
 
@@ -154,17 +153,17 @@ TEST_CASE("Runtime writes random data to per-worker files with multiple workers"
 
 namespace {
 
-Task<void> write_random_sized_file(IO& io, std::string path, std::vector<uint8_t> data, size_t job_idx,
+Task<void> write_random_sized_file(Scheduler& scheduler, std::string path, std::vector<uint8_t> data, size_t job_idx,
                                     std::atomic<int>& order_counter, std::vector<int>& completion_order,
                                     std::atomic<int>& completed) {
-    Open open_op(io, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
+    Open open_op(scheduler, path.c_str(), O_CREAT | O_WRONLY | O_TRUNC);
     int fd = co_await open_op;
 
     if (fd >= 0) {
-        Write write_op(io, fd, data.data(), data.size());
+        Write write_op(scheduler, fd, data.data(), data.size());
         co_await write_op;
 
-        Close close_op(io, fd);
+        Close close_op(scheduler, fd);
         co_await close_op;
     }
 
@@ -202,8 +201,8 @@ TEST_CASE("Runtime handles jobs with random write sizes that may complete out of
 
     for (size_t i = 0; i < kNumJobs; ++i) {
         runtime.post([path = paths[i], data = datas[i], i, &order_counter, &completion_order, &completed](
-                         IO& io, Scheduler& scheduler, size_t /*worker_idx*/) {
-            scheduler.spawn(write_random_sized_file(io, path, data, i, order_counter, completion_order, completed));
+                         Scheduler& scheduler, size_t /*worker_idx*/) {
+            scheduler.spawn(write_random_sized_file(scheduler, path, data, i, order_counter, completion_order, completed));
         });
     }
 

@@ -269,7 +269,7 @@ TEST_CASE("Scheduler", "[io][scheduler]") {
         {
             IO        io;
             Scheduler sched{io};
-            auto      coro = [&]() -> Task<void> { n = co_await Recv{io, r, &n, 1}; };
+            auto      coro = [&]() -> Task<void> { n = co_await Recv{sched, r, &n, 1}; };
             sched.spawn(coro());
         } // sched destructor calls shutdown()
         REQUIRE(n != 0); // was written into by the recv result (1 byte = result 1)
@@ -287,8 +287,8 @@ TEST_CASE("Scheduler", "[io][scheduler]") {
         char buf1[4]{}, buf2[4]{};
         int  n1{0}, n2{0};
 
-        auto c1 = [&]() -> Task<void> { n1 = co_await Recv{io, r1, buf1, sizeof(buf1)}; };
-        auto c2 = [&]() -> Task<void> { n2 = co_await Recv{io, r2, buf2, sizeof(buf2)}; };
+        auto c1 = [&]() -> Task<void> { n1 = co_await Recv{sched, r1, buf1, sizeof(buf1)}; };
+        auto c2 = [&]() -> Task<void> { n2 = co_await Recv{sched, r2, buf2, sizeof(buf2)}; };
         sched.spawn(c1());
         sched.spawn(c2());
         sched.shutdown();
@@ -310,8 +310,8 @@ TEST_CASE("Scheduler", "[io][scheduler]") {
         char buf1[4]{}, buf2[4]{};
         int  n1{0}, n2{0};
         auto coro = [&]() -> Task<void> {
-            n1 = co_await Recv{io, r, buf1, 1};
-            n2 = co_await Recv{io, r, buf2, 1};
+            n1 = co_await Recv{sched, r, buf1, 1};
+            n2 = co_await Recv{sched, r, buf2, 1};
         };
         sched.spawn(coro());
         sched.shutdown();
@@ -343,12 +343,12 @@ TEST_CASE("Scheduler", "[io][scheduler]") {
         // First recv saturates the single SQE slot.
         ::write(w, "x", 1);
         char buf1[4]{};
-        auto coro1 = [&]() -> Task<void> { co_await Recv{io, r, buf1, 1}; };
+        auto coro1 = [&]() -> Task<void> { co_await Recv{sched, r, buf1, 1}; };
         sched.spawn(coro1());
 
         // Second spawn hits the full SQ and throws IOException(SQFull).
         char buf2[4]{};
-        auto coro2 = [&]() -> Task<void> { co_await Recv{io, r, buf2, sizeof(buf2)}; };
+        auto coro2 = [&]() -> Task<void> { co_await Recv{sched, r, buf2, sizeof(buf2)}; };
         bool threw = false;
         try {
             sched.spawn(coro2());
@@ -375,7 +375,7 @@ TEST_CASE("Recv", "[io][operations]") {
         char buf[16]{};
         int  n{0};
 
-        auto coro = [&]() -> Task<void> { n = co_await Recv{io, reader, buf, sizeof(buf)}; };
+        auto coro = [&]() -> Task<void> { n = co_await Recv{sched, reader, buf, sizeof(buf)}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -392,7 +392,7 @@ TEST_CASE("Recv", "[io][operations]") {
         char buf[16]{};
         int  n{-1};
 
-        auto coro = [&]() -> Task<void> { n = co_await Recv{io, reader, buf, sizeof(buf)}; };
+        auto coro = [&]() -> Task<void> { n = co_await Recv{sched, reader, buf, sizeof(buf)}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -406,7 +406,7 @@ TEST_CASE("Recv", "[io][operations]") {
         char      buf[4]{};
         int       n{0};
 
-        auto coro = [&]() -> Task<void> { n = co_await Recv{io, -1, buf, sizeof(buf)}; };
+        auto coro = [&]() -> Task<void> { n = co_await Recv{sched, -1, buf, sizeof(buf)}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -421,7 +421,7 @@ TEST_CASE("Send", "[io][operations]") {
         auto [reader, writer] = make_socket_pair();
         int n{0};
 
-        auto coro = [&]() -> Task<void> { n = co_await Send{io, writer, "world", 5}; };
+        auto coro = [&]() -> Task<void> { n = co_await Send{sched, writer, "world", 5}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -437,7 +437,7 @@ TEST_CASE("Send", "[io][operations]") {
         Scheduler sched{io};
         int       n{0};
 
-        auto coro = [&]() -> Task<void> { n = co_await Send{io, -1, "x", 1}; };
+        auto coro = [&]() -> Task<void> { n = co_await Send{sched, -1, "x", 1}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -460,7 +460,7 @@ TEST_CASE("Accept", "[io][operations]") {
             ::close(fd);
         });
 
-        auto coro = [&]() -> Task<void> { client_fd = co_await Accept{io, listener}; };
+        auto coro = [&]() -> Task<void> { client_fd = co_await Accept{sched, listener}; };
         sched.spawn(coro());
         sched.shutdown();
         connector.join();
@@ -479,7 +479,7 @@ TEST_CASE("Accept", "[io][operations]") {
 
         std::thread connector([port]() { ::close(connect_to(port)); });
 
-        auto coro = [&]() -> Task<void> { client_fd = co_await Accept{io, listener}; };
+        auto coro = [&]() -> Task<void> { client_fd = co_await Accept{sched, listener}; };
         sched.spawn(coro());
         sched.shutdown();
         connector.join();
@@ -504,7 +504,7 @@ TEST_CASE("Close", "[io][operations]") {
         REQUIRE(fd >= 0);
         int result{-1};
 
-        auto coro = [&]() -> Task<void> { result = co_await Close{io, fd}; };
+        auto coro = [&]() -> Task<void> { result = co_await Close{sched, fd}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -516,7 +516,7 @@ TEST_CASE("Close", "[io][operations]") {
         Scheduler sched{io};
         int       result{0};
 
-        auto coro = [&]() -> Task<void> { result = co_await Close{io, -1}; };
+        auto coro = [&]() -> Task<void> { result = co_await Close{sched, -1}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -538,8 +538,8 @@ TEST_CASE("Read and Write", "[io][operations]") {
         char read_buf[16]{};
 
         auto coro = [&]() -> Task<void> {
-            written    = co_await Write{io, fd, "testdata", 8, 0};
-            read_bytes = co_await Read{io, fd, read_buf, sizeof(read_buf), 0};
+            written    = co_await Write{sched, fd, "testdata", 8, 0};
+            read_bytes = co_await Read{sched, fd, read_buf, sizeof(read_buf), 0};
         };
         sched.spawn(coro());
         sched.shutdown();
@@ -557,7 +557,7 @@ TEST_CASE("Read and Write", "[io][operations]") {
         char      buf[4]{};
         int       result{0};
 
-        auto coro = [&]() -> Task<void> { result = co_await Read{io, -1, buf, sizeof(buf)}; };
+        auto coro = [&]() -> Task<void> { result = co_await Read{sched, -1, buf, sizeof(buf)}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -569,7 +569,7 @@ TEST_CASE("Read and Write", "[io][operations]") {
         Scheduler sched{io};
         int       result{0};
 
-        auto coro = [&]() -> Task<void> { result = co_await Write{io, -1, "x", 1}; };
+        auto coro = [&]() -> Task<void> { result = co_await Write{sched, -1, "x", 1}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -589,7 +589,7 @@ TEST_CASE("Open", "[io][operations]") {
         ::close(tmp);
 
         int opened_fd{-1};
-        auto coro = [&]() -> Task<void> { opened_fd = co_await Open{io, path, O_RDONLY}; };
+        auto coro = [&]() -> Task<void> { opened_fd = co_await Open{sched, path, O_RDONLY}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -603,7 +603,7 @@ TEST_CASE("Open", "[io][operations]") {
         Scheduler sched{io};
         int       opened_fd{0};
 
-        auto coro = [&]() -> Task<void> { opened_fd = co_await Open{io, "/nonexistent/path/file", O_RDONLY}; };
+        auto coro = [&]() -> Task<void> { opened_fd = co_await Open{sched, "/nonexistent/path/file", O_RDONLY}; };
         sched.spawn(coro());
         sched.shutdown();
 
@@ -623,7 +623,7 @@ TEST_CASE("Stat", "[io][operations]") {
         ::write(tmp, "x", 1);
         ::close(tmp);
 
-        Stat stat_op{io, path};
+        Stat stat_op{sched, path};
         int  result{-1};
 
         auto coro = [&]() -> Task<void> { result = co_await stat_op; };
@@ -638,7 +638,7 @@ TEST_CASE("Stat", "[io][operations]") {
     SECTION("returns negative errno for nonexistent path") {
         IO        io;
         Scheduler sched{io};
-        Stat      stat_op{io, "/nonexistent/path/file"};
+        Stat      stat_op{sched, "/nonexistent/path/file"};
         int       result{0};
 
         auto coro = [&]() -> Task<void> { result = co_await stat_op; };

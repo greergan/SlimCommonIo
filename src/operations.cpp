@@ -5,7 +5,7 @@ namespace slim::common::io {
 
 // ─── Accept ─────────────────────────────────────────────────────────────────
 
-Accept::Accept(IO& io_ref, int sfd) : Awaitable(io_ref), server_fd(sfd) {}
+Accept::Accept(Scheduler& scheduler, int sfd) : Awaitable(scheduler), server_fd(sfd) {}
 
 void Accept::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -18,7 +18,7 @@ void Accept::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Close ──────────────────────────────────────────────────────────────────
 
-Close::Close(IO& io_ref, int fd_) : Awaitable(io_ref), fd(fd_) {}
+Close::Close(Scheduler& scheduler, int fd_) : Awaitable(scheduler), fd(fd_) {}
 
 void Close::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -28,8 +28,8 @@ void Close::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Open ───────────────────────────────────────────────────────────────────
 
-Open::Open(IO& io_ref, const char* path_, int flags_, mode_t mode_, int dfd_)
-    : Awaitable(io_ref), dfd(dfd_), path(path_), flags(flags_), mode(mode_) {}
+Open::Open(Scheduler& scheduler, const char* path_, int flags_, mode_t mode_, int dfd_)
+    : Awaitable(scheduler), dfd(dfd_), path(path_), flags(flags_), mode(mode_) {}
 
 void Open::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -42,8 +42,8 @@ void Open::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Read ───────────────────────────────────────────────────────────────────
 
-Read::Read(IO& io_ref, int fd_, void* buf_, size_t len_, uint64_t offset_)
-    : Awaitable(io_ref), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
+Read::Read(Scheduler& scheduler, int fd_, void* buf_, size_t len_, uint64_t offset_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
 
 void Read::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -56,8 +56,8 @@ void Read::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Recv ───────────────────────────────────────────────────────────────────
 
-Recv::Recv(IO& io_ref, int fd_, void* buf_, size_t len_, int flags_)
-    : Awaitable(io_ref), fd(fd_), buf(buf_), len(len_), flags(flags_) {}
+Recv::Recv(Scheduler& scheduler, int fd_, void* buf_, size_t len_, int flags_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), flags(flags_) {}
 
 void Recv::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -70,8 +70,8 @@ void Recv::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Send ───────────────────────────────────────────────────────────────────
 
-Send::Send(IO& io_ref, int fd_, const void* buf_, size_t len_, int flags_)
-    : Awaitable(io_ref), fd(fd_), buf(buf_), len(len_), flags(flags_) {}
+Send::Send(Scheduler& scheduler, int fd_, const void* buf_, size_t len_, int flags_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), flags(flags_) {}
 
 void Send::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -84,8 +84,8 @@ void Send::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Stat ───────────────────────────────────────────────────────────────────
 
-Stat::Stat(IO& io_ref, const char* path_, int flags_, uint32_t mask_, int dfd_)
-    : Awaitable(io_ref), dfd(dfd_), path(path_), flags(flags_), mask(mask_) {}
+Stat::Stat(Scheduler& scheduler, const char* path_, int flags_, uint32_t mask_, int dfd_)
+    : Awaitable(scheduler), dfd(dfd_), path(path_), flags(flags_), mask(mask_) {}
 
 void Stat::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));
@@ -99,8 +99,8 @@ void Stat::prepare(io_uring_sqe* sqe) noexcept {
 
 // ─── Write ──────────────────────────────────────────────────────────────────
 
-Write::Write(IO& io_ref, int fd_, const void* buf_, size_t len_, uint64_t offset_)
-    : Awaitable(io_ref), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
+Write::Write(Scheduler& scheduler, int fd_, const void* buf_, size_t len_, uint64_t offset_)
+    : Awaitable(scheduler), fd(fd_), buf(buf_), len(len_), offset(offset_) {}
 
 void Write::prepare(io_uring_sqe* sqe) noexcept {
     memset(sqe, 0, sizeof(*sqe));

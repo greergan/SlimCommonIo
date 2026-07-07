@@ -42,10 +42,10 @@ TEST_CASE("Scheduler runs multiple tasks concurrently", "[io][scheduler]") {
         // the compiler may elide the closure copy into the coroutine frame, leaving
         // the frame with a dangling reference once the temporary is destroyed.
         auto coro1 = [&]() -> Task<void> {
-            n1 = co_await Recv{io, r1, buf1, sizeof(buf1)};
+            n1 = co_await Recv{sched, r1, buf1, sizeof(buf1)};
         };
         auto coro2 = [&]() -> Task<void> {
-            n2 = co_await Recv{io, r2, buf2, sizeof(buf2)};
+            n2 = co_await Recv{sched, r2, buf2, sizeof(buf2)};
         };
 
         sched.spawn(coro1());

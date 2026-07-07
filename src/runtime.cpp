@@ -38,12 +38,12 @@ void Runtime::stop() {
     state_ = State::Stopped;
 }
 
-void Runtime::post(std::function<void(IO&, Scheduler&, size_t)> job) {
+void Runtime::post(std::function<void(Scheduler&, size_t)> job) {
     dispatcher_.post([this, job = std::move(job)]() {
         size_t idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % workers_.size();
         WorkerNode& w = *workers_[idx];
         w.scheduler.post([&w, idx, job]() {
-            job(w.io, w.scheduler, idx);
+            job(w.scheduler, idx);
         });
     });
 }

@@ -36,7 +36,7 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 - A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
 - An `Awaitable` base that hooks directly into the coroutine awaiter protocol and stages SQEs for batched submission
 - Eight concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
-- A cooperative `Scheduler` that drives the event loop, submits staged SQEs in batch, blocks on an `epoll` instance watching both the `io_uring` fd and an `eventfd` wakeup channel, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
+- A cooperative `Scheduler` that owns the `IO` ring reference, drives the event loop, submits staged SQEs in batch, blocks on an `epoll` instance watching both the `io_uring` fd and an `eventfd` wakeup channel, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
 - A `Runtime` that owns one dispatcher scheduler plus N worker schedulers, each on its own thread and ring, with round-robin job dispatch
 - An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
 
@@ -49,13 +49,14 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | Raw `io_uring` | Ring setup, SQE submission, and CQE reaping done manually — no liburing dependency |
 | Single-mmap optimization | CQ ring reuses the SQ `mmap` allocation when `IORING_FEAT_SINGLE_MMAP` is available |
 | Coroutine tasks | `Task<T>` implements the C++20 coroutine promise protocol via a `ValueStore<T>` base; always suspends at start; handles both value and `void` returns in a single template |
-| Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()` |
+| Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()`. Constructed from a `Scheduler&` — callers never need to hold or pass an `IO&` themselves |
 | SQ backpressure | `Scheduler::spawn()` checks SQ capacity before calling `resume()`. If already full, it throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. A second check via a thread-local side-channel catches the case where the SQ fills mid-coroutine inside `await_suspend` |
 | Batched submission | SQEs are staged in `await_suspend` and flushed to the kernel in a single `io_uring_enter` call at the start of each `drain()` tick |
 | Epoll-based blocking drain | When the CQ is empty after submission, `drain()` blocks in `epoll_wait` on an epoll instance that watches both the `io_uring` fd (CQEs) and the `eventfd` (new `post()`ed work). This prevents the scheduler thread from hanging if a `post()` arrives while the ring is completely idle |
 | Cross-thread posting | `Scheduler::post(std::function<void()>)` is thread-safe; any thread (including a V8 isolate thread) can queue work onto the scheduler. An `eventfd` is written to wake the blocked event loop. If `spawn()` throws `SQFull` inside the inbox drain, the callable is re-queued and the `eventfd` is poked again so it retries on the next drain cycle |
 | Cooperative scheduler | `Scheduler::run()` loops drain → reap until a `std::stop_token` fires; a `std::stop_callback` writes to the `eventfd` to break out of any blocked `epoll_wait`. `shutdown()` flushes all pending tasks |
-| Runtime | `Runtime` owns a dispatcher IO/Scheduler/thread plus N worker IO/Scheduler/thread units. `Runtime::post()` enqueues a job onto the dispatcher, which round-robins it to a worker's `post()`/`spawn()` |
+| Encapsulated IO ring | `Scheduler` is the sole owner-facing handle to the `IO` ring. Operations and jobs take a `Scheduler&` and reach the ring internally via `Scheduler::io()`; nothing outside `Scheduler`/`Awaitable` construction needs to see `IO` directly |
+| Runtime | `Runtime` owns a dispatcher IO/Scheduler/thread plus N worker IO/Scheduler/thread units. `Runtime::post()` enqueues a job onto the dispatcher, which round-robins it to a worker's `post()`/`spawn()`. Worker jobs receive only the worker's `Scheduler&`, never its `IO&` |
 | Linux-only | Requires Linux 5.1+ (`io_uring`) and `linux/io_uring.h` kernel headers; no platform abstraction layer |
 
 [↑ Top](#table-of-contents)
@@ -90,9 +91,9 @@ slim::common::IO io;
 slim::common::IO io(512); // custom ring depth
 ```
 
-`IO` is the root resource. It owns the `io_uring` file descriptor and all `mmap` regions for the SQ ring, SQ entries array, and CQ ring. All operations and the scheduler hold a reference to it.
+`IO` is the root resource. It owns the `io_uring` file descriptor and all `mmap` regions for the SQ ring, SQ entries array, and CQ ring. A `Scheduler` holds the reference to it; operations and jobs never need to hold or pass an `IO&` of their own — they go through a `Scheduler&` instead.
 
-`IO` is non-copyable. Move is not defined — construct one instance per thread or io context and pass it by reference.
+`IO` is non-copyable. Move is not defined — construct one instance per thread or io context and pass it by reference (typically only to a `Scheduler` constructor).
 
 | Member | Type | Description |
 |--------|------|-------------|
@@ -137,13 +138,13 @@ slim::common::io::Task<void> t;   // fire-and-forget task
 ```cpp
 // Not constructed directly — subclassed by each operation
 struct MyOp : slim::common::io::Awaitable {
-    MyOp(IO& io) : Awaitable(io) {}
+    MyOp(Scheduler& scheduler) : Awaitable(scheduler) {}
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override { /* fill sqe */ }
 };
 ```
 
-`Awaitable` implements the C++20 awaiter protocol and handles all SQE acquisition boilerplate. Subclasses only override `prepare()` to fill in the opcode and operation-specific fields. SQEs are staged in the ring on suspension and flushed to the kernel in batch by `Scheduler::drain()`.
+`Awaitable` implements the C++20 awaiter protocol and handles all SQE acquisition boilerplate. It's constructed from a `Scheduler&` and fetches the `IO&` it needs from `Scheduler::io()` once, at construction — subclasses and callers never handle `IO` directly. Subclasses only override `prepare()` to fill in the opcode and operation-specific fields. SQEs are staged in the ring on suspension and flushed to the kernel in batch by `Scheduler::drain()`.
 
 | Method | Description |
 |--------|-------------|
@@ -156,18 +157,18 @@ protected:
 
 ### Operations
 
-All operations live in `slim::common::io` and derive from `Awaitable`. All return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall), or a negative errno on failure.
+All operations live in `slim::common::io` and derive from `Awaitable`. Each constructor takes a `Scheduler&` — not an `IO&` — so operations can be constructed anywhere a `Scheduler&` is in scope, including inside jobs dispatched to worker threads that never see the underlying `IO` ring. All return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall), or a negative errno on failure.
 
 | Operation | Constructor | `io_uring` opcode | Notes |
 |-----------|-------------|-------------------|-------|
-| `Accept` | `Accept(IO&, int server_fd)` | `IORING_OP_ACCEPT` | Yields the accepted client fd. Socket created with `SOCK_NONBLOCK \| SOCK_CLOEXEC`. Peer address available via `addr` / `addr_len` members |
-| `Close` | `Close(IO&, int fd)` | `IORING_OP_CLOSE` | Async fd close |
-| `Open` | `Open(IO&, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD)` | `IORING_OP_OPENAT` | Yields the opened fd on success |
-| `Read` | `Read(IO&, int fd, void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_READ` | Yields bytes read |
-| `Recv` | `Recv(IO&, int fd, void* buf, size_t len, int flags = 0)` | `IORING_OP_RECV` | Yields bytes received |
-| `Send` | `Send(IO&, int fd, const void* buf, size_t len, int flags = 0)` | `IORING_OP_SEND` | Yields bytes sent |
-| `Stat` | `Stat(IO&, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd = AT_FDCWD)` | `IORING_OP_STATX` | Result in `buf` member (`struct statx`) on success |
-| `Write` | `Write(IO&, int fd, const void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_WRITE` | Yields bytes written |
+| `Accept` | `Accept(Scheduler&, int server_fd)` | `IORING_OP_ACCEPT` | Yields the accepted client fd. Socket created with `SOCK_NONBLOCK \| SOCK_CLOEXEC`. Peer address available via `addr` / `addr_len` members |
+| `Close` | `Close(Scheduler&, int fd)` | `IORING_OP_CLOSE` | Async fd close |
+| `Open` | `Open(Scheduler&, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD)` | `IORING_OP_OPENAT` | Yields the opened fd on success |
+| `Read` | `Read(Scheduler&, int fd, void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_READ` | Yields bytes read |
+| `Recv` | `Recv(Scheduler&, int fd, void* buf, size_t len, int flags = 0)` | `IORING_OP_RECV` | Yields bytes received |
+| `Send` | `Send(Scheduler&, int fd, const void* buf, size_t len, int flags = 0)` | `IORING_OP_SEND` | Yields bytes sent |
+| `Stat` | `Stat(Scheduler&, const char* path, int flags = 0, uint32_t mask = STATX_BASIC_STATS, int dfd = AT_FDCWD)` | `IORING_OP_STATX` | Result in `buf` member (`struct statx`) on success |
+| `Write` | `Write(Scheduler&, int fd, const void* buf, size_t len, uint64_t offset = 0)` | `IORING_OP_WRITE` | Yields bytes written |
 
 [↑ Top](#table-of-contents)
 
@@ -178,7 +179,7 @@ slim::common::IO io;
 slim::common::io::Scheduler sched(io);
 ```
 
-`Scheduler` drives the coroutine event loop. It holds a `std::vector<Task<void>>` of live tasks, an `IO&` reference, an `eventfd` for cross-thread wakeup, and an `epoll` instance that watches both the `eventfd` and the `io_uring` fd. It is non-copyable.
+`Scheduler` drives the coroutine event loop and is the sole owner-facing handle to the `IO` ring. It holds a `std::vector<Task<void>>` of live tasks, an `IO&` reference, an `eventfd` for cross-thread wakeup, and an `epoll` instance that watches both the `eventfd` and the `io_uring` fd. It is non-copyable.
 
 | Method | Description |
 |--------|-------------|
@@ -187,6 +188,7 @@ slim::common::io::Scheduler sched(io);
 | `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled. A `std::stop_callback` writes to the `eventfd` to break out of any blocked `epoll_wait` immediately |
 | `shutdown()` | Flushes all remaining tasks by looping `drain()` → `reap()` until the task list is empty. Called automatically by the destructor if tasks remain |
 | `eventfd()` | Returns the scheduler's `eventfd` file descriptor. Exposed for advanced use cases |
+| `io()` | Returns the `IO&` the scheduler owns. Used internally by `Awaitable`'s constructor; call sites building `Accept`/`Close`/`Open`/`Read`/`Recv`/`Send`/`Stat`/`Write` should pass the `Scheduler&` itself rather than reaching for this |
 
 **`drain()`** — first attempts a non-blocking read of the `eventfd`; if signalled, drains the inbox. Then submits all staged SQEs via a single `io_uring_enter` call. Then processes all available CQEs, resuming the associated coroutine for each and advancing the CQ head. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in `epoll_wait(-1)` on an epoll instance watching both the `io_uring` fd and the `eventfd`, so that either a new CQE or a new `post()` will wake it. Returns after the wait without processing — the next `drain()` call from `run()`'s loop handles the new event.
 
@@ -207,8 +209,8 @@ sched.spawn(coro());  // correct — named variable
 ```cpp
 slim::common::io::Runtime rt(4);   // 4 worker threads, 256-entry rings
 rt.start();
-rt.post([](IO& io, Scheduler& sched, size_t idx) {
-    // runs on worker idx's thread
+rt.post([](Scheduler& sched, size_t idx) {
+    // runs on worker idx's thread — sched is all that's needed here
 });
 rt.stop();
 ```
@@ -220,12 +222,12 @@ rt.stop();
 | `Runtime(size_t worker_count, uint32_t entries = 256)` | Constructs the dispatcher ring/scheduler and all worker `WorkerNode`s. Worker threads start immediately. Throws `IOException` on any ring or scheduler construction failure |
 | `start()` | Starts the dispatcher thread. Throws `IOException(ErrorStatus::RuntimeNotIdle)` if called more than once or after `stop()` |
 | `stop()` | Signals the dispatcher and all workers to stop, joins their threads, and calls `shutdown()` on every scheduler. Safe to call more than once |
-| `post(job)` | Thread-safe. Posts a job to the dispatcher, which round-robins it to a worker's `post()`/`spawn()`. `job` receives `(IO& worker_io, Scheduler& worker_scheduler, size_t worker_idx)` |
+| `post(job)` | Thread-safe. Posts a job to the dispatcher, which round-robins it to a worker's `post()`/`spawn()`. `job` receives `(Scheduler& worker_scheduler, size_t worker_idx)` — the worker's `IO` ring is not exposed; construct operations directly from `worker_scheduler` |
 | `dispatcher_scheduler()` | Returns a reference to the dispatcher's `Scheduler` |
 | `worker(size_t idx)` | Returns a reference to the `WorkerNode` at `idx` |
 | `worker_count()` | Returns the number of worker nodes |
 
-**`WorkerNode`** — each node owns its `IO` ring, its `Scheduler`, a `std::stop_source`, and a `std::jthread` that drives the scheduler's event loop. `stop_and_join()` requests stop, joins the thread, and calls `scheduler.shutdown()`.
+**`WorkerNode`** — each node owns its `IO` ring, its `Scheduler`, a `std::stop_source`, and a `std::jthread` that drives the scheduler's event loop. The `IO` ring is an implementation detail of the node; jobs dispatched via `Runtime::post()` only ever see the node's `Scheduler&`. `stop_and_join()` requests stop, joins the thread, and calls `scheduler.shutdown()`.
 
 [↑ Top](#table-of-contents)
 
@@ -286,20 +288,21 @@ slim::common::IO io(512);
 
 ```cpp
 // Read a file asynchronously
+slim::common::io::Scheduler sched(io);
+
 auto read_file = [&]() -> slim::common::io::Task<void> {
-    slim::common::io::Open open(io, "/etc/hostname", O_RDONLY);
+    slim::common::io::Open open(sched, "/etc/hostname", O_RDONLY);
     int fd = co_await open;
     if (fd < 0) co_return;
 
     char buf[256]{};
-    slim::common::io::Read read(io, fd, buf, sizeof(buf));
+    slim::common::io::Read read(sched, fd, buf, sizeof(buf));
     int n = co_await read;
 
-    slim::common::io::Close close(io, fd);
+    slim::common::io::Close close(sched, fd);
     co_await close;
 };
 
-slim::common::io::Scheduler sched(io);
 auto coro = read_file();
 sched.spawn(std::move(coro));
 sched.shutdown();
@@ -308,22 +311,22 @@ sched.shutdown();
 ```cpp
 // Accept loop — serve connections until stopped
 std::stop_source stop;
+slim::common::io::Scheduler sched(io);
 
 auto accept_loop = [&]() -> slim::common::io::Task<void> {
     while (true) {
-        slim::common::io::Accept accept(io, server_fd);
+        slim::common::io::Accept accept(sched, server_fd);
         int client_fd = co_await accept;
         if (client_fd < 0) break;
 
-        slim::common::io::Send send(io, client_fd, "hello\n", 6);
+        slim::common::io::Send send(sched, client_fd, "hello\n", 6);
         co_await send;
 
-        slim::common::io::Close close(io, client_fd);
+        slim::common::io::Close close(sched, client_fd);
         co_await close;
     }
 };
 
-slim::common::io::Scheduler sched(io);
 auto coro = accept_loop();
 sched.spawn(std::move(coro));
 sched.run(stop.get_token()); // blocks until stop.request_stop()
@@ -334,7 +337,7 @@ sched.run(stop.get_token()); // blocks until stop.request_stop()
 sched.post([&]() {
     // runs on the scheduler thread during the next drain() tick
     auto send = [&]() -> slim::common::io::Task<void> {
-        slim::common::io::Send s(io, client_fd, "pushed\n", 7);
+        slim::common::io::Send s(sched, client_fd, "pushed\n", 7);
         co_await s;
     };
     auto coro = send();
@@ -343,14 +346,16 @@ sched.post([&]() {
 ```
 
 ```cpp
-// Use Runtime for a multi-threaded dispatcher/worker setup
+// Use Runtime for a multi-threaded dispatcher/worker setup.
+// Jobs only ever see the worker's Scheduler& — the IO ring stays
+// encapsulated inside the WorkerNode.
 slim::common::io::Runtime rt(4); // 4 workers
 rt.start();
 
-rt.post([](slim::common::IO& io, slim::common::io::Scheduler& sched, size_t idx) {
-    auto job = [&io]() -> slim::common::io::Task<void> {
+rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
+    auto job = [&sched]() -> slim::common::io::Task<void> {
         char buf[256]{};
-        slim::common::io::Read read(io, some_fd, buf, sizeof(buf));
+        slim::common::io::Read read(sched, some_fd, buf, sizeof(buf));
         int n = co_await read;
         // handle result
     };

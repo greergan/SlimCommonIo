@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <slim/common/io/awaitable.h>
 #include <slim/common/io/error_codes.h>
+#include <slim/common/io/scheduler.h>
 namespace slim::common::io {
 // ── SQFull side-channel ──────────────────────────────────────────────────────
 // await_suspend() cannot propagate exceptions to spawn() because the coroutine
@@ -18,7 +19,7 @@ IOException* take_pending_sq_error() noexcept {
     return &tl_sq_full_ex;
 }
 // ── Awaitable ────────────────────────────────────────────────────────────────
-Awaitable::Awaitable(IO& io_ref) : io_(io_ref) {}
+Awaitable::Awaitable(Scheduler& scheduler) : io_(scheduler.io()) {}
 bool Awaitable::await_ready() const noexcept { return false; }
 bool Awaitable::await_suspend(std::coroutine_handle<> h) {
     auto* sqe = acquire_sqe();

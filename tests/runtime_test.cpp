@@ -23,7 +23,6 @@
 #include <thread>
 #include <vector>
 
-using slim::common::IO;
 using slim::common::io::Close;
 using slim::common::io::Open;
 using slim::common::io::Read;
@@ -62,19 +61,19 @@ struct PerWorkerStats {
     std::vector<std::atomic<int>> completed;
 };
 
-Task<void> read_one_file_on_worker(IO& io, std::string path, PerWorkerStats& stats, size_t worker_idx) {
-    Open open_op(io, path.c_str(), O_RDONLY);
+Task<void> read_one_file_on_worker(Scheduler& scheduler, std::string path, PerWorkerStats& stats, size_t worker_idx) {
+    Open open_op(scheduler, path.c_str(), O_RDONLY);
     int fd = co_await open_op;
 
     if (fd >= 0) {
         char buf[4096];
-        Read read_op(io, fd, buf, sizeof(buf));
+        Read read_op(scheduler, fd, buf, sizeof(buf));
         int n = co_await read_op;
         if (n >= 0) {
             stats.succeeded[worker_idx].fetch_add(1, std::memory_order_relaxed);
         }
 
-        Close close_op(io, fd);
+        Close close_op(scheduler, fd);
         co_await close_op;
     }
 
@@ -104,8 +103,8 @@ TEST_CASE("Runtime hands off work from multiple client threads to worker schedul
         clients.emplace_back([&, c]() {
             for (size_t i = c; i < files.size(); i += kNumClientThreads) {
                 std::string path = files[i];
-                runtime.post([path, &stats](IO& io, Scheduler& scheduler, size_t idx) {
-                    scheduler.spawn(read_one_file_on_worker(io, path, stats, idx));
+                runtime.post([path, &stats](Scheduler& scheduler, size_t idx) {
+                    scheduler.spawn(read_one_file_on_worker(scheduler, path, stats, idx));
                 });
             }
         });
@@ -146,8 +145,8 @@ TEST_CASE("Runtime with a single worker still functions", "[runtime]") {
     PerWorkerStats stats(1);
     std::atomic<int> posted{0};
 
-    runtime.post([&stats, &posted](IO& io, Scheduler& scheduler, size_t idx) {
-        scheduler.spawn(read_one_file_on_worker(io, "/etc/hostname", stats, idx));
+    runtime.post([&stats, &posted](Scheduler& scheduler, size_t idx) {
+        scheduler.spawn(read_one_file_on_worker(scheduler, "/etc/hostname", stats, idx));
         posted.fetch_add(1, std::memory_order_relaxed);
     });
 

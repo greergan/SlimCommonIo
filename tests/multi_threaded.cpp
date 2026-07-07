@@ -93,19 +93,19 @@ struct ReadStats {
     std::atomic<int> completed{0};
 };
 
-Task<void> read_one_file(IO& io, std::string path, ReadStats& stats) {
-    Open open_op(io, path.c_str(), O_RDONLY);
+Task<void> read_one_file(Scheduler& scheduler, std::string path, ReadStats& stats) {
+    Open open_op(scheduler, path.c_str(), O_RDONLY);
     int fd = co_await open_op;
 
     if (fd >= 0) {
         char buf[4096];
-        Read read_op(io, fd, buf, sizeof(buf));
+        Read read_op(scheduler, fd, buf, sizeof(buf));
         int n = co_await read_op;
         if (n >= 0) {
             stats.succeeded.fetch_add(1, std::memory_order_relaxed);
         }
 
-        Close close_op(io, fd);
+        Close close_op(scheduler, fd);
         co_await close_op;
     }
     // Permission errors (EACCES) on some /etc files are expected and not
@@ -146,8 +146,8 @@ TEST_CASE("Concurrent /etc reads from multiple threads", "[scheduler][multithrea
         workers.emplace_back([&, t]() {
             for (size_t i = t; i < files.size(); i += kNumThreads) {
                 std::string path = files[i];
-                scheduler.post([&io, &scheduler, &stats, path]() {
-                    scheduler.spawn(read_one_file(io, path, stats));
+                scheduler.post([&scheduler, &stats, path]() {
+                    scheduler.spawn(read_one_file(scheduler, path, stats));
                 });
             }
         });
@@ -213,8 +213,8 @@ TEST_CASE("Many threads hammering a single Scheduler::post", "[scheduler][multit
         workers.emplace_back([&, t]() {
             for (size_t i = 0; i < kPostsPerThread; ++i) {
                 const std::string& path = files[(t + i) % files.size()];
-                scheduler.post([&io, &scheduler, &stats, path]() {
-                    scheduler.spawn(read_one_file(io, path, stats));
+                scheduler.post([&scheduler, &stats, path]() {
+                    scheduler.spawn(read_one_file(scheduler, path, stats));
                 });
             }
         });
@@ -260,19 +260,19 @@ struct PerWorkerStats {
     std::vector<std::atomic<int>> completed;
 };
 
-Task<void> read_one_file_on_worker(IO& io, std::string path, PerWorkerStats& stats, size_t worker_idx) {
-    Open open_op(io, path.c_str(), O_RDONLY);
+Task<void> read_one_file_on_worker(Scheduler& scheduler, std::string path, PerWorkerStats& stats, size_t worker_idx) {
+    Open open_op(scheduler, path.c_str(), O_RDONLY);
     int fd = co_await open_op;
 
     if (fd >= 0) {
         char buf[4096];
-        Read read_op(io, fd, buf, sizeof(buf));
+        Read read_op(scheduler, fd, buf, sizeof(buf));
         int n = co_await read_op;
         if (n >= 0) {
             stats.succeeded[worker_idx].fetch_add(1, std::memory_order_relaxed);
         }
 
-        Close close_op(io, fd);
+        Close close_op(scheduler, fd);
         co_await close_op;
     }
 
@@ -342,7 +342,7 @@ TEST_CASE("One scheduler hands off work to multiple worker schedulers", "[schedu
                     size_t idx = next_worker.fetch_add(1, std::memory_order_relaxed) % kNumWorkers;
                     WorkerNode& worker = *workers[idx];
                     worker.scheduler.post([&worker, &stats, path, idx]() {
-                        worker.scheduler.spawn(read_one_file_on_worker(worker.io, path, stats, idx));
+                        worker.scheduler.spawn(read_one_file_on_worker(worker.scheduler, path, stats, idx));
                     });
                 });
             }
