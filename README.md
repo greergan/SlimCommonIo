@@ -1,3 +1,4 @@
+
 # SlimCommonIo
 
 <a href="https://codeberg.org/greergan/SlimTS">
@@ -5,7 +6,7 @@
 </a>
 
 A low-level, Linux-native async I/O runtime built directly on `io_uring`.  
-Provides coroutine-based I/O operations, a cooperative task scheduler with cross-thread posting, and a thin ring-management layer with no external userspace dependencies.  
+Provides coroutine-based I/O operations, a cooperative task scheduler with cross-thread posting, per-operation kernel-enforced timeouts, and a thin ring-management layer with no external userspace dependencies.  
 Part of the [SlimCommon](https://codeberg.org/greergan/SlimCommon) library.  
 Built using [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).  
 CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).
@@ -34,8 +35,8 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 
 - Manual SQ and CQ ring setup with `mmap`, including `IORING_FEAT_SINGLE_MMAP` optimization
 - A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
-- An `Awaitable` base that hooks directly into the coroutine awaiter protocol and stages SQEs for batched submission
-- Eight concrete async operations: `Accept`, `Close`, `Open`, `Read`, `Recv`, `Send`, `Stat`, `Write`
+- An `Awaitable` base that hooks directly into the coroutine awaiter protocol, stages SQEs for batched submission, and supports an opt-in kernel-enforced deadline per operation via `IOSQE_IO_LINK`
+- Nine concrete async operations: `Accept`, `Close`, `Connect`, `Open`, `Poll`, `Read`, `Recv`, `Send`, `Stat`, `Write`
 - A cooperative `Scheduler` that owns the `IO` ring reference, drives the event loop, submits staged SQEs in batch, blocks on an `epoll` instance watching both the `io_uring` fd and an `eventfd` wakeup channel, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
 - A `Runtime` that owns one dispatcher scheduler plus N worker schedulers, each on its own thread and ring, with round-robin job dispatch
 - An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
@@ -50,7 +51,9 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | Single-mmap optimization | CQ ring reuses the SQ `mmap` allocation when `IORING_FEAT_SINGLE_MMAP` is available |
 | Coroutine tasks | `Task<T>` implements the C++20 coroutine promise protocol via a `ValueStore<T>` base; always suspends at start; handles both value and `void` returns in a single template |
 | Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()`. Constructed from a `Scheduler&` — callers never need to hold or pass an `IO&` themselves |
-| SQ backpressure | `Scheduler::spawn()` checks SQ capacity before calling `resume()`. If already full, it throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. A second check via a thread-local side-channel catches the case where the SQ fills mid-coroutine inside `await_suspend` |
+| Kernel-enforced per-op timeout | Any `Awaitable`-derived operation can call `with_timeout(std::chrono::milliseconds)` before being `co_await`ed. This links the operation's SQE to a kernel-side `IORING_OP_LINK_TIMEOUT` SQE via `IOSQE_IO_LINK` — if the deadline passes first, the kernel cancels the operation for us automatically. No manual `IORING_OP_ASYNC_CANCEL`, no extra coroutine-visible state: on timeout the operation's own CQE still arrives normally with `result == -ECANCELED` (or `-ETIME`), the same `int` failure contract as every other error path |
+| Two-phase SQE reservation | Acquiring ring slots is split into a capacity check (`has_capacity(count)`) and a commit step (`commit_one()`), reserving all slots an operation needs — one, or two when linked to a timeout — atomically. This prevents an orphaned `IOSQE_IO_LINK` SQE from being committed alone on a ring with no room left for its timeout companion |
+| SQ backpressure | `Scheduler::spawn()` checks SQ capacity before calling `resume()`. If already full, it throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. A second check via a thread-local side-channel catches the case where the SQ fills mid-coroutine inside `await_suspend` — including when a linked timeout operation needs two slots and only one is free |
 | Batched submission | SQEs are staged in `await_suspend` and flushed to the kernel in a single `io_uring_enter` call at the start of each `drain()` tick |
 | Epoll-based blocking drain | When the CQ is empty after submission, `drain()` blocks in `epoll_wait` on an epoll instance that watches both the `io_uring` fd (CQEs) and the `eventfd` (new `post()`ed work). This prevents the scheduler thread from hanging if a `post()` arrives while the ring is completely idle |
 | Cross-thread posting | `Scheduler::post(std::function<void()>)` is thread-safe; any thread (including a V8 isolate thread) can queue work onto the scheduler. An `eventfd` is written to wake the blocked event loop. If `spawn()` throws `SQFull` inside the inbox drain, the callable is re-queued and the `eventfd` is poked again so it retries on the next drain cycle |
@@ -77,7 +80,10 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 | `Recv::flags` | `0` | `MSG_*` flags passed to the underlying `recv` |
 | `Send::flags` | `0` | `MSG_*` flags passed to the underlying `send` |
 | `Accept` socket flags | `SOCK_NONBLOCK \| SOCK_CLOEXEC` | Always applied; not overridable via the constructor |
+| `Poll::poll_mask` | — (required) | Same bitmask as `poll(2)` — `POLLIN`, `POLLOUT`, etc. Result on success is the ready-mask (`revents`-equivalent) |
+| `Connect::addr` | — (required) | Copied into internal storage at construction; caller's original `sockaddr` may safely go out of scope before the coroutine resumes |
 | `Awaitable::result` | `0` | Overwritten by the CQE result on completion |
+| `Awaitable` timeout | none | Opt-in only — call `with_timeout(ms)` before `co_await` to enable |
 | `Runtime(worker_count, entries)` | entries=`256` | Each worker and the dispatcher use the same ring depth |
 
 [↑ Top](#table-of-contents)
@@ -146,24 +152,37 @@ protected:
 
 `Awaitable` implements the C++20 awaiter protocol and handles all SQE acquisition boilerplate. It's constructed from a `Scheduler&` and fetches the `IO&` it needs from `Scheduler::io()` once, at construction — subclasses and callers never handle `IO` directly. Subclasses only override `prepare()` to fill in the opcode and operation-specific fields. SQEs are staged in the ring on suspension and flushed to the kernel in batch by `Scheduler::drain()`.
 
+Any operation can opt into a kernel-enforced deadline by calling `with_timeout()` before `co_await`ing it:
+
+```cpp
+Recv recv_op{sched, fd, buf, sizeof(buf)};
+recv_op.with_timeout(std::chrono::milliseconds(500));
+int n = co_await recv_op; // -ECANCELED (or -ETIME) if 500ms passes with nothing received
+```
+
+Internally this reserves two ring slots instead of one — the operation's own SQE (flagged `IOSQE_IO_LINK`) plus a companion `IORING_OP_LINK_TIMEOUT` SQE with `user_data` left at zero. The kernel guarantees that if the timeout fires first, the linked operation is cancelled and its CQE still arrives normally, just with a cancellation result. `Scheduler::drain()` already ignores any CQE whose `user_data` is null, so the timeout companion's own completion requires no special handling.
+
 | Method | Description |
 |--------|-------------|
 | `await_ready()` | Always returns `false` — every operation suspends the coroutine |
-| `await_suspend(handle)` | Acquires an SQE, calls `prepare()`, and sets `user_data` to `this`. If the SQ is full, sets a thread-local error flag and returns `false` to resume the coroutine immediately without suspending; `Scheduler::spawn()` detects this flag after `resume()` returns and throws `IOException(ErrorStatus::SQFull)` |
+| `await_suspend(handle)` | Reserves one ring slot (or two, if `with_timeout()` was called) via a capacity check followed by commit. Calls `prepare()` on the primary slot, sets its `user_data` to `this`, and — if timed — flags it `IOSQE_IO_LINK` and fills the companion `IORING_OP_LINK_TIMEOUT` slot. If the required slots aren't all available, sets a thread-local error flag and returns `false` to resume the coroutine immediately without suspending; `Scheduler::spawn()` detects this flag after `resume()` returns and throws `IOException(ErrorStatus::SQFull)` |
 | `await_resume()` | Returns `result` as `int` |
+| `with_timeout(std::chrono::milliseconds)` | Opt-in. Must be called before `co_await`ing the object. Enables the linked-timeout behavior described above |
 | `prepare(sqe)` | Pure virtual. Called with a zeroed SQE slot; subclass fills opcode and fields |
 
 [↑ Top](#table-of-contents)
 
 ### Operations
 
-All operations live in `slim::common::io` and derive from `Awaitable`. Each constructor takes a `Scheduler&` — not an `IO&` — so operations can be constructed anywhere a `Scheduler&` is in scope, including inside jobs dispatched to worker threads that never see the underlying `IO` ring. `Read` and `Write` take a `std::span` over `uint32_t` storage rather than a separate `(void*, size_t)` pair — the buffer supplies its own length, so a `std::vector<uint32_t>` (or any contiguous `uint32_t` container) can be passed directly with no explicit size argument. All operations return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall — `Read`/`Write` yield the raw byte count from the kernel, not an element count), or a negative errno on failure.
+All operations live in `slim::common::io` and derive from `Awaitable`. Each constructor takes a `Scheduler&` — not an `IO&` — so operations can be constructed anywhere a `Scheduler&` is in scope, including inside jobs dispatched to worker threads that never see the underlying `IO` ring. `Read` and `Write` take a `std::span` over `uint32_t` storage rather than a separate `(void*, size_t)` pair — the buffer supplies its own length, so a `std::vector<uint32_t>` (or any contiguous `uint32_t` container) can be passed directly with no explicit size argument. All operations return `int` when `co_await`ed: a non-negative value on success (semantics match the underlying syscall — `Read`/`Write` yield the raw byte count from the kernel, not an element count), or a negative errno on failure. Every operation can additionally opt into a kernel-enforced deadline via `with_timeout()` (see [Awaitable](#awaitable)).
 
 | Operation | Constructor | `io_uring` opcode | Notes |
 |-----------|-------------|-------------------|-------|
 | `Accept` | `Accept(Scheduler&, int server_fd)` | `IORING_OP_ACCEPT` | Yields the accepted client fd. Socket created with `SOCK_NONBLOCK \| SOCK_CLOEXEC`. Peer address available via `addr` / `addr_len` members |
 | `Close` | `Close(Scheduler&, int fd)` | `IORING_OP_CLOSE` | Async fd close |
+| `Connect` | `Connect(Scheduler&, int fd, const sockaddr* addr, socklen_t addr_len)` | `IORING_OP_CONNECT` | Yields `0` on success, negative errno on failure. `addr` is copied into internal storage at construction — the caller's original `sockaddr` may go out of scope before the coroutine resumes |
 | `Open` | `Open(Scheduler&, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD)` | `IORING_OP_OPENAT` | Yields the opened fd on success |
+| `Poll` | `Poll(Scheduler&, int fd, uint32_t poll_mask)` | `IORING_OP_POLL_ADD` | Yields the ready-mask (`revents`-equivalent, e.g. `POLLIN`) on success, negative errno on failure. Useful for driving readiness-based protocols (e.g. a TLS handshake retry loop on `SSL_ERROR_WANT_READ`/`WANT_WRITE`) without a dedicated read/write op |
 | `Read` | `Read(Scheduler&, int fd, std::span<uint32_t> buf, uint64_t offset = 0)` | `IORING_OP_READ` | Yields bytes read (raw kernel byte count, not divided by `sizeof(uint32_t)`) |
 | `Recv` | `Recv(Scheduler&, int fd, void* buf, size_t len, int flags = 0)` | `IORING_OP_RECV` | Yields bytes received |
 | `Send` | `Send(Scheduler&, int fd, const void* buf, size_t len, int flags = 0)` | `IORING_OP_SEND` | Yields bytes sent |
@@ -183,14 +202,14 @@ slim::common::io::Scheduler sched(io);
 
 | Method | Description |
 |--------|-------------|
-| `spawn(Task<T>&&)` | Checks SQ capacity before calling `resume()`. If the SQ is already full, throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. Otherwise, resumes the task to its first suspension point and takes ownership. Also throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full during that first resume, or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
+| `spawn(Task<T>&&)` | Checks SQ capacity before calling `resume()`. If the SQ is already full, throws `IOException(ErrorStatus::SQFull)` immediately, before any user code in the task runs. Otherwise, resumes the task to its first suspension point and takes ownership. Also throws `IOException(ErrorStatus::SQFull)` if `await_suspend` found the SQ full during that first resume (including a linked-timeout op needing two slots with only one free), or `IOException(ErrorStatus::BadAllocation)` if the internal task vector cannot grow. **Do not pass an inline temporary lambda directly** — bind it to a named variable first to avoid GCC coroutine UB (see note below) |
 | `post(std::function<void()>)` | Thread-safe. Enqueues a callable onto the scheduler's inbox and writes to the `eventfd` to wake the event loop. Safe to call from any thread including a V8 isolate thread. If the callable throws `SQFull` inside the inbox drain, it is re-queued and the `eventfd` is poked again for a later retry |
 | `run(std::stop_token)` | Loops `drain()` → `reap()` until the stop token is signalled. A `std::stop_callback` writes to the `eventfd` to break out of any blocked `epoll_wait` immediately |
 | `shutdown()` | Flushes all remaining tasks by looping `drain()` → `reap()` until the task list is empty. Called automatically by the destructor if tasks remain |
 | `eventfd()` | Returns the scheduler's `eventfd` file descriptor. Exposed for advanced use cases |
-| `io()` | Returns the `IO&` the scheduler owns. Used internally by `Awaitable`'s constructor; call sites building `Accept`/`Close`/`Open`/`Read`/`Recv`/`Send`/`Stat`/`Write` should pass the `Scheduler&` itself rather than reaching for this |
+| `io()` | Returns the `IO&` the scheduler owns. Used internally by `Awaitable`'s constructor; call sites building any operation should pass the `Scheduler&` itself rather than reaching for this |
 
-**`drain()`** — first attempts a non-blocking read of the `eventfd`; if signalled, drains the inbox. Then submits all staged SQEs via a single `io_uring_enter` call. Then processes all available CQEs, resuming the associated coroutine for each and advancing the CQ head. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in `epoll_wait(-1)` on an epoll instance watching both the `io_uring` fd and the `eventfd`, so that either a new CQE or a new `post()` will wake it. Returns after the wait without processing — the next `drain()` call from `run()`'s loop handles the new event.
+**`drain()`** — first attempts a non-blocking read of the `eventfd`; if signalled, drains the inbox. Then submits all staged SQEs via a single `io_uring_enter` call. Then processes all available CQEs, resuming the associated coroutine for each and advancing the CQ head — CQEs with a null `user_data` (the silent companion half of a linked timeout pair) are skipped rather than dereferenced. If the CQ is still empty after submission and the scheduler is not shutting down, it blocks in `epoll_wait(-1)` on an epoll instance watching both the `io_uring` fd and the `eventfd`, so that either a new CQE or a new `post()` will wake it. Returns after the wait without processing — the next `drain()` call from `run()`'s loop handles the new event.
 
 **`reap()`** — sweeps `tasks_` and erases completed entries. Currently O(n); an intrusive list is the recommended optimization for high-IOPS paths.
 
@@ -223,7 +242,7 @@ rt.stop();
 | `start()` | Starts the dispatcher thread. Throws `IOException(ErrorStatus::RuntimeNotIdle)` if called more than once or after `stop()` |
 | `stop()` | Signals the dispatcher and all workers to stop, joins their threads, and calls `shutdown()` on every scheduler. Safe to call more than once |
 | `post(job)` | Thread-safe. Posts a job to the dispatcher, which round-robins it to a worker's `post()`/`spawn()`. `job` receives `(Scheduler& worker_scheduler, size_t worker_idx)` — the worker's `IO` ring is not exposed; construct operations directly from `worker_scheduler` |
-| `dispatcher_scheduler()` | Returns a reference to the dispatcher's `Scheduler` |
+| `dispatcher_scheduler()` | Returns a reference to the dispatcher's `Scheduler`. **Note:** `spawn()` is not thread-safe against that scheduler's own driving thread — code running on any *other* thread must reach the dispatcher via `dispatcher_scheduler().post(...)`, never `dispatcher_scheduler().spawn(...)` directly |
 | `worker(size_t idx)` | Returns a reference to the `WorkerNode` at `idx` |
 | `worker_count()` | Returns the number of worker nodes |
 
@@ -250,11 +269,11 @@ Constructor failures on `IO` and `Scheduler`, spawn-time failures on `Scheduler`
 | `IOMmapSqFailed` | `"IO mmap SQ ring failed"` | SQ ring `mmap` failed |
 | `IOSetupFailed` | `"IO setup failed"` | `SYS_io_uring_setup` returned a negative fd |
 | `RuntimeNotIdle` | `"Runtime not idle"` | `Runtime::start()` called when the runtime is not in the idle state |
-| `SQFull` | `"Submission queue full"` | `Scheduler::spawn()` was called while every SQ slot was occupied |
+| `SQFull` | `"Submission queue full"` | `Scheduler::spawn()` was called while every SQ slot was occupied, or an operation using `with_timeout()` needed two slots with only one available |
 
 `IOException::status()` returns the `ErrorStatus` value. `what()` returns the corresponding string from `error_status_str[]`.
 
-I/O operations (all `Awaitable` subclasses) do **not** throw — they return a negative errno as an `int` result from `co_await`, following the Linux syscall convention.
+I/O operations (all `Awaitable` subclasses) do **not** throw — they return a negative errno as an `int` result from `co_await`, following the Linux syscall convention. This includes cancellation via a linked `with_timeout()` deadline: a timed-out operation resolves with `result == -ECANCELED` (or `-ETIME`), not an exception.
 
 [↑ Top](#table-of-contents)
 
@@ -262,7 +281,7 @@ I/O operations (all `Awaitable` subclasses) do **not** throw — they return a n
 
 This library is built using [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager). See that repository for build instructions.
 
-Requires Linux 5.1+ and kernel headers providing `linux/io_uring.h`. A C++20-capable compiler with coroutine support is required.
+Requires Linux 5.1+ and kernel headers providing `linux/io_uring.h`.
 
 [↑ Top](#table-of-contents)
 
@@ -321,6 +340,44 @@ rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
 ```
 
 ```cpp
+// Outbound connect with a kernel-enforced deadline. If the peer never
+// responds within 2 seconds, the kernel cancels the connect for us and
+// the coroutine sees a negative result -- no manual timer bookkeeping.
+rt.post([addr, addr_len](slim::common::io::Scheduler& sched, size_t idx) {
+    auto job = [&sched, addr, addr_len]() -> slim::common::io::Task<void> {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int flags = ::fcntl(fd, F_GETFL);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        slim::common::io::Connect connect_op(sched, fd,
+            reinterpret_cast<const sockaddr*>(&addr), addr_len);
+        connect_op.with_timeout(std::chrono::seconds(2));
+
+        int result = co_await connect_op;
+        if (result < 0) {
+            // -ECANCELED (or -ETIME): deadline passed before connect finished
+            ::close(fd);
+            co_return;
+        }
+        // connected -- proceed with Send/Recv on fd
+    };
+    auto coro = job();
+    sched.spawn(std::move(coro));
+});
+```
+
+```cpp
+// Poll for readiness -- e.g. driving a non-blocking TLS handshake retry
+// loop on SSL_ERROR_WANT_READ / WANT_WRITE, without a dedicated recv/send.
+auto wait_readable = [&sched, fd]() -> slim::common::io::Task<int> {
+    slim::common::io::Poll poll_op(sched, fd, POLLIN);
+    poll_op.with_timeout(std::chrono::milliseconds(500));
+    int revents = co_await poll_op; // >= 0 ready-mask, or negative on timeout/error
+    co_return revents;
+};
+```
+
+```cpp
 // Accept loop — serve connections on a worker until Runtime stops it.
 // A worker's Scheduler::shutdown() (invoked internally by Runtime::stop())
 // flushes pending tasks, so the loop coroutine doesn't need its own
@@ -347,6 +404,9 @@ rt.post([server_fd](slim::common::io::Scheduler& sched, size_t idx) {
 ```cpp
 // rt.post() is itself the thread-safe hand-off point — call it from any
 // thread (including a V8 isolate thread) to enqueue work on a worker.
+// The same rule applies to a single Scheduler in isolation: post() is
+// thread-safe, spawn() is only safe from the thread driving that
+// scheduler's own run()/drain() loop.
 std::thread producer([&rt, client_fd]() {
     rt.post([client_fd](slim::common::io::Scheduler& sched, size_t idx) {
         auto send = [&sched, client_fd]() -> slim::common::io::Task<void> {
