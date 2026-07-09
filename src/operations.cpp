@@ -26,6 +26,25 @@ void Close::prepare(io_uring_sqe* sqe) noexcept {
     sqe->fd     = fd;
 }
 
+// ─── Connect ────────────────────────────────────────────────────────────────
+
+Connect::Connect(Scheduler& scheduler, int fd_, const sockaddr* addr_, socklen_t addr_len_)
+    : Awaitable(scheduler), fd(fd_), addr_len(addr_len_) {
+    // Copy the caller's sockaddr into our own storage. The Connect object
+    // (like Accept) must own its addr buffer for the full lifetime of the
+    // operation, since the kernel reads it asynchronously and the caller's
+    // original sockaddr may go out of scope before the coroutine resumes.
+    memcpy(&addr, addr_, addr_len_);
+}
+
+void Connect::prepare(io_uring_sqe* sqe) noexcept {
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_CONNECT;
+    sqe->fd     = fd;
+    sqe->addr   = reinterpret_cast<uint64_t>(&addr);
+    sqe->off    = addr_len;
+}
+
 // ─── Open ───────────────────────────────────────────────────────────────────
 
 Open::Open(Scheduler& scheduler, const char* path_, int flags_, mode_t mode_, int dfd_)
@@ -38,6 +57,18 @@ void Open::prepare(io_uring_sqe* sqe) noexcept {
     sqe->addr       = reinterpret_cast<uint64_t>(path);
     sqe->open_flags = static_cast<uint32_t>(flags);
     sqe->len        = mode;
+}
+
+// ─── Poll ───────────────────────────────────────────────────────────────────
+
+Poll::Poll(Scheduler& scheduler, int fd_, uint32_t poll_mask_)
+    : Awaitable(scheduler), fd(fd_), poll_mask(poll_mask_) {}
+
+void Poll::prepare(io_uring_sqe* sqe) noexcept {
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode        = IORING_OP_POLL_ADD;
+    sqe->fd            = fd;
+    sqe->poll32_events = poll_mask;
 }
 
 // ─── Read ───────────────────────────────────────────────────────────────────

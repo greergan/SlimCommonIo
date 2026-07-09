@@ -2,31 +2,60 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <optional>
 #include <linux/io_uring.h>
 #include <slim/common/io.h>
 #include <slim/common/io/error_codes.h>
+
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
 namespace slim::common::io {
+
 class Scheduler;
+
 // Side-channel read by spawn() after handle.resume() to detect SQFull.
 // Returns a pointer to a thread-local IOException if await_suspend() found
 // the SQ full; nullptr otherwise. Clears the flag on read.
 IOException* take_pending_sq_error() noexcept;
+
 class Awaitable {
 public:
     int                     result{0};
     std::coroutine_handle<> handle{};
+
     explicit Awaitable(Scheduler& scheduler);
     virtual ~Awaitable() = default;
+
+    // Opt-in per-instance deadline. Call before co_await-ing this object.
+    // Submits this op linked (IOSQE_IO_LINK) to a kernel-side
+    // IORING_OP_LINK_TIMEOUT SQE. If the timeout fires first, the kernel
+    // automatically cancels this op for us -- no manual ASYNC_CANCEL, no
+    // extra coroutine-visible state. On timeout, this op's own CQE still
+    // arrives normally with result == -ECANCELED, same int contract as
+    // every other failure path.
+    void with_timeout(std::chrono::milliseconds timeout) noexcept;
+
     bool await_ready()  const noexcept;
     bool await_suspend(std::coroutine_handle<> h);
     int  await_resume() const noexcept;
+
 protected:
     virtual void prepare(io_uring_sqe* sqe) noexcept = 0;
+
 private:
-    IO&           io_;
-    io_uring_sqe* acquire_sqe() noexcept;
+    IO&                                     io_;
+    std::optional<__kernel_timespec>        timeout_ts_;
+
+    // Two-phase reservation: check capacity for `count` contiguous slots
+    // before committing any of them. Needed because a linked op + its
+    // timeout companion must both land in the ring or neither does --
+    // committing the first slot alone on a full ring would orphan a
+    // dangling IOSQE_IO_LINK with no follow-up SQE.
+    bool          has_capacity(uint32_t count) const noexcept;
+    io_uring_sqe* commit_one() noexcept;
     void          submit() noexcept;
 };
+
 } // namespace slim::common::io

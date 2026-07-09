@@ -34,6 +34,17 @@ protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
 };
 
+struct Connect : Awaitable {
+    int              fd;
+    sockaddr_storage addr{};
+    socklen_t        addr_len{0};
+
+    Connect(Scheduler& scheduler, int fd, const sockaddr* addr, socklen_t addr_len);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
 struct Open : Awaitable {
     int         dfd;
     const char* path;
@@ -41,6 +52,16 @@ struct Open : Awaitable {
     mode_t      mode;
 
     Open(Scheduler& scheduler, const char* path, int flags, mode_t mode = 0644, int dfd = AT_FDCWD);
+
+protected:
+    void prepare(io_uring_sqe* sqe) noexcept override;
+};
+
+struct Poll : Awaitable {
+    int      fd;
+    uint32_t poll_mask; // POLLIN, POLLOUT, etc. -- same bitmask as poll(2)
+
+    Poll(Scheduler& scheduler, int fd, uint32_t poll_mask);
 
 protected:
     void prepare(io_uring_sqe* sqe) noexcept override;
