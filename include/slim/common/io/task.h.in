@@ -1,40 +1,64 @@
-#pragma once
+#ifndef SLIM_COMMON_IO_TASK_H
+#define SLIM_COMMON_IO_TASK_H
+
 #include <coroutine>
 #include <exception>
-#include <type_traits>
+
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
+
 namespace slim::common::io {
-template <typename T>
-struct ValueStore {
-    T value{};
-    void return_value(T v) noexcept { value = std::move(v); }
+
+// Resumes a stored continuation (if any) via symmetric transfer when the
+// coroutine's body finishes -- this is what lets a Task<T> be co_await-ed
+// from inside another coroutine rather than only driven externally via
+// Scheduler::spawn()/resume()/result().
+struct FinalAwaiter {
+    bool await_ready() noexcept { return false; }
+
+    template<typename Promise>
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
+        auto continuation = h.promise().continuation;
+        return continuation ? continuation : std::noop_coroutine();
+    }
+
+    void await_resume() noexcept {}
 };
-template <>
-struct ValueStore<void> {
-    void return_void() noexcept {}
-};
-// ── Task<T> ──────────────────────────────────────────────────────────────────
-template <typename T>
+
+template<typename T>
 struct Task {
-    struct Promise : ValueStore<T> {
-        std::exception_ptr exception{};
+    struct Promise {
+        T                       value{};
+        std::exception_ptr      exception{};
+        std::coroutine_handle<> continuation{};
+
         Task get_return_object() {
             return Task{std::coroutine_handle<Promise>::from_promise(*this)};
         }
+
         std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend()   noexcept { return {}; }
+        FinalAwaiter         final_suspend()   noexcept { return {}; }
+
+        void return_value(T v) noexcept {
+            value = std::move(v);
+        }
+
         void unhandled_exception() noexcept {
             exception = std::current_exception();
         }
     };
+
     using promise_type = Promise;
+
     explicit Task(std::coroutine_handle<Promise> handle) : handle_(handle) {}
+
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
+
     Task(Task&& other) noexcept : handle_(other.handle_) {
         other.handle_ = nullptr;
     }
+
     Task& operator=(Task&& other) noexcept {
         if (this != &other) {
             if (handle_) handle_.destroy();
@@ -43,25 +67,132 @@ struct Task {
         }
         return *this;
     }
+
     ~Task() {
         if (handle_) handle_.destroy();
     }
+
     bool resume() {
         if (!handle_ || handle_.done()) return false;
         handle_.resume();
         return !handle_.done();
     }
+
     bool done() const noexcept {
         return !handle_ || handle_.done();
     }
+
     T result() {
-        if (handle_.promise().exception)
+        if (handle_.promise().exception) {
             std::rethrow_exception(handle_.promise().exception);
-        if constexpr (!std::is_void_v<T>)
-            return std::move(handle_.promise().value);
+        }
+        return std::move(handle_.promise().value);
     }
+
     std::coroutine_handle<Promise> handle() const noexcept { return handle_; }
+
+    // ── Awaiter interface: lets a Task<T> be co_await-ed from another
+    // coroutine, in addition to being driven via Scheduler::spawn(). ──
+    bool await_ready() const noexcept { return false; }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
+        // Store the awaiting coroutine as our continuation, then transfer
+        // control to this task's own (not-yet-started, since
+        // initial_suspend is suspend_always) coroutine body via symmetric
+        // transfer. If the inner body suspends on its own I/O (Recv, Poll,
+        // etc.), that suspension unwinds normally back up the call stack --
+        // Scheduler::drain() will resume it again later like any other
+        // coroutine. Only on the inner body's actual completion does
+        // FinalAwaiter transfer back to the continuation stored here.
+        handle_.promise().continuation = awaiting;
+        return handle_;
+    }
+
+    T await_resume() {
+        return result();
+    }
+
 private:
     std::coroutine_handle<Promise> handle_{nullptr};
 };
+
+template<>
+struct Task<void> {
+    struct Promise {
+        std::exception_ptr      exception{};
+        std::coroutine_handle<> continuation{};
+
+        Task get_return_object() {
+            return Task{std::coroutine_handle<Promise>::from_promise(*this)};
+        }
+
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        FinalAwaiter         final_suspend()   noexcept { return {}; }
+
+        void return_void() noexcept {}
+
+        void unhandled_exception() noexcept {
+            exception = std::current_exception();
+        }
+    };
+
+    using promise_type = Promise;
+
+    explicit Task(std::coroutine_handle<Promise> handle) : handle_(handle) {}
+
+    Task(const Task&)            = delete;
+    Task& operator=(const Task&) = delete;
+
+    Task(Task&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Task& operator=(Task&& other) noexcept {
+        if (this != &other) {
+            if (handle_) handle_.destroy();
+            handle_       = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~Task() {
+        if (handle_) handle_.destroy();
+    }
+
+    bool resume() {
+        if (!handle_ || handle_.done()) return false;
+        handle_.resume();
+        return !handle_.done();
+    }
+
+    bool done() const noexcept {
+        return !handle_ || handle_.done();
+    }
+
+    void result() {
+        if (handle_.promise().exception) {
+            std::rethrow_exception(handle_.promise().exception);
+        }
+    }
+
+    std::coroutine_handle<Promise> handle() const noexcept { return handle_; }
+
+    bool await_ready() const noexcept { return false; }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
+        handle_.promise().continuation = awaiting;
+        return handle_;
+    }
+
+    void await_resume() {
+        result();
+    }
+
+private:
+    std::coroutine_handle<Promise> handle_{nullptr};
+};
+
 } // namespace slim::common::io
+
+#endif // SLIM_COMMON_IO_TASK_H

@@ -1,4 +1,3 @@
-
 # SlimCommonIo
 
 <a href="https://codeberg.org/greergan/SlimTS">
@@ -6,7 +5,7 @@
 </a>
 
 A low-level, Linux-native async I/O runtime built directly on `io_uring`.  
-Provides coroutine-based I/O operations, a cooperative task scheduler with cross-thread posting, per-operation kernel-enforced timeouts, and a thin ring-management layer with no external userspace dependencies.  
+Provides coroutine-based I/O operations with composable nested `co_await`, a cooperative task scheduler with cross-thread posting, per-operation kernel-enforced timeouts, and a thin ring-management layer with no external userspace dependencies.  
 Part of the [SlimCommon](https://codeberg.org/greergan/SlimCommon) library.  
 Built using [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).  
 CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager).
@@ -34,9 +33,9 @@ CI/CD supplied by unified workflows provided by [SlimLibraryPackager](https://co
 This library provides a coroutine-native async I/O layer backed directly by `io_uring` via raw `SYS_io_uring_setup` / `SYS_io_uring_enter` syscalls:
 
 - Manual SQ and CQ ring setup with `mmap`, including `IORING_FEAT_SINGLE_MMAP` optimization
-- A C++20 coroutine `Task<T>` type unified across value and `void` returns via a `ValueStore<T>` base
+- A C++20 coroutine `Task<T>` type unified across value and `void` returns, supporting both external driving via `Scheduler::spawn()` and composable nested `co_await` from within other coroutines via a built-in awaiter interface and `FinalAwaiter` continuation chain
 - An `Awaitable` base that hooks directly into the coroutine awaiter protocol, stages SQEs for batched submission, and supports an opt-in kernel-enforced deadline per operation via `IOSQE_IO_LINK`
-- Nine concrete async operations: `Accept`, `Close`, `Connect`, `Open`, `Poll`, `Read`, `Recv`, `Send`, `Stat`, `Write`
+- Ten concrete async operations: `Accept`, `Close`, `Connect`, `Open`, `Poll`, `Read`, `Recv`, `Send`, `Stat`, `Write`
 - A cooperative `Scheduler` that owns the `IO` ring reference, drives the event loop, submits staged SQEs in batch, blocks on an `epoll` instance watching both the `io_uring` fd and an `eventfd` wakeup channel, reaps completed tasks, and supports cross-thread task posting via an `eventfd`-based inbox
 - A `Runtime` that owns one dispatcher scheduler plus N worker schedulers, each on its own thread and ring, with round-robin job dispatch
 - An `ErrorStatus` enum and `IOException` for constructor-time and spawn-time failures; all I/O operations return raw `int` results following Linux errno convention
@@ -49,7 +48,7 @@ This library provides a coroutine-native async I/O layer backed directly by `io_
 |---------|-------------|
 | Raw `io_uring` | Ring setup, SQE submission, and CQE reaping done manually — no liburing dependency |
 | Single-mmap optimization | CQ ring reuses the SQ `mmap` allocation when `IORING_FEAT_SINGLE_MMAP` is available |
-| Coroutine tasks | `Task<T>` implements the C++20 coroutine promise protocol via a `ValueStore<T>` base; always suspends at start; handles both value and `void` returns in a single template |
+| Coroutine tasks | `Task<T>` is both an external-driven coroutine (via `Scheduler::spawn()` / `resume()` / `result()`) and a first-class awaitable — one `Task<T>` can `co_await` another `Task<T>` directly, with `FinalAwaiter` transferring control back to the outer coroutine via symmetric transfer when the inner one completes. Exceptions propagate naturally through nested `co_await` chains |
 | Composable awaitables | `Awaitable` base implements `await_ready` / `await_suspend` / `await_resume`; subclasses only override `prepare()`. Constructed from a `Scheduler&` — callers never need to hold or pass an `IO&` themselves |
 | Kernel-enforced per-op timeout | Any `Awaitable`-derived operation can call `with_timeout(std::chrono::milliseconds)` before being `co_await`ed. This links the operation's SQE to a kernel-side `IORING_OP_LINK_TIMEOUT` SQE via `IOSQE_IO_LINK` — if the deadline passes first, the kernel cancels the operation for us automatically. No manual `IORING_OP_ASYNC_CANCEL`, no extra coroutine-visible state: on timeout the operation's own CQE still arrives normally with `result == -ECANCELED` (or `-ETIME`), the same `int` failure contract as every other error path |
 | Two-phase SQE reservation | Acquiring ring slots is split into a capacity check (`has_capacity(count)`) and a commit step (`commit_one()`), reserving all slots an operation needs — one, or two when linked to a timeout — atomically. This prevents an orphaned `IOSQE_IO_LINK` SQE from being committed alone on a ring with no room left for its timeout companion |
@@ -126,7 +125,9 @@ slim::common::io::Task<int>  t;   // value-returning task
 slim::common::io::Task<void> t;   // fire-and-forget task
 ```
 
-`Task<T>` is the coroutine return type used throughout the library. It is a single unified template: value storage and the `return_value` / `return_void` promise methods are provided by a `ValueStore<T>` base, which is explicitly specialised for `void` to avoid the ill-formed `void v` parameter that arises from naive `requires`-guarded approaches. The coroutine always suspends at the initial suspend point — the body does not begin running until `resume()` is called or the task is handed to `Scheduler::spawn()`.
+`Task<T>` is the coroutine return type used throughout the library. It serves two roles simultaneously: an **externally-driven coroutine** (handed to `Scheduler::spawn()`, resumed by the event loop, result retrieved via `result()`) and a **first-class awaitable** (directly `co_await`-able from within another coroutine, with the outer coroutine automatically continuing once the inner one completes).
+
+The two-role design is implemented via a `FinalAwaiter` on the promise's `final_suspend`. When a `Task<T>` is `co_await`-ed by an outer coroutine, `await_suspend` stores the outer coroutine handle as a continuation on the inner promise and transfers control to the inner coroutine via symmetric transfer. When the inner coroutine finishes, `FinalAwaiter::await_suspend` resumes the stored continuation — or falls back to `std::noop_coroutine()` when the task was driven externally with no awaiting continuation. This means existing `Scheduler::spawn()`-based code is entirely unaffected.
 
 `Task<T>` is non-copyable. It is move-only and destroys its coroutine handle on destruction.
 
@@ -136,6 +137,9 @@ slim::common::io::Task<void> t;   // fire-and-forget task
 | `done()` | `bool` | Returns `true` if the coroutine has completed |
 | `result()` | `T` | Returns the coroutine's return value, or rethrows a stored exception |
 | `handle()` | `std::coroutine_handle<Promise>` | Raw handle; used internally by `Scheduler::spawn()` |
+| `await_ready()` | `bool` | Always `false` — the inner coroutine hasn't run yet when awaited |
+| `await_suspend(handle)` | `std::coroutine_handle<>` | Stores the outer coroutine as continuation, returns the inner handle for symmetric transfer |
+| `await_resume()` | `T` | Calls `result()` — returns the value or rethrows a stored exception |
 
 [↑ Top](#table-of-contents)
 
@@ -281,7 +285,7 @@ I/O operations (all `Awaitable` subclasses) do **not** throw — they return a n
 
 This library is built using [SlimLibraryPackager](https://codeberg.org/greergan/SlimLibraryPackager). See that repository for build instructions.
 
-Requires Linux 5.1+ and kernel headers providing `linux/io_uring.h`.
+Requires Linux 5.1+ and kernel headers providing `linux/io_uring.h`. A C++20-capable compiler with coroutine support is required.
 
 [↑ Top](#table-of-contents)
 
@@ -299,18 +303,32 @@ none
 
 ```cpp
 // Construct a Runtime — 4 worker threads, 256-entry rings.
-// Runtime owns every IO ring internally (one per worker, one for the
-// dispatcher); nothing outside Runtime/Scheduler ever touches IO directly.
 slim::common::io::Runtime rt(4);
 rt.start();
 ```
 
 ```cpp
+// Compose coroutines: an inner Task<T> can be co_await-ed from any outer
+// coroutine. Control returns to the outer coroutine via FinalAwaiter
+// symmetric transfer once the inner one completes. Exceptions propagate
+// naturally through the chain.
+auto inner = [&sched]() -> slim::common::io::Task<int> {
+    slim::common::io::Recv recv(sched, fd, buf, sizeof(buf));
+    int n = co_await recv;
+    co_return n;
+};
+
+auto outer = [&sched, &inner]() -> slim::common::io::Task<void> {
+    int bytes = co_await inner(); // inner suspends on Recv; outer waits transparently
+    // process bytes ...
+};
+
+auto coro = outer();
+sched.spawn(std::move(coro));
+```
+
+```cpp
 // Open/write/read/close a file inside a job dispatched to a worker.
-// Read/Write take their buffer as a std::span<uint32_t>
-// (std::span<const uint32_t> for Write), so a std::vector<uint32_t> can be
-// passed with no separate size argument — the buffer's own size() supplies
-// the length.
 rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
     auto job = [&sched]() -> slim::common::io::Task<void> {
         slim::common::io::Open open(sched, "/tmp/example.dat", O_CREAT | O_WRONLY | O_TRUNC);
@@ -318,8 +336,8 @@ rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
         if (fd < 0) co_return;
 
         std::vector<uint32_t> write_buf{0x11111111, 0x22222222, 0x33333333};
-        slim::common::io::Write write(sched, fd, write_buf); // 12 bytes, no explicit length
-        int written = co_await write;                        // raw byte count from the kernel
+        slim::common::io::Write write(sched, fd, write_buf);
+        int written = co_await write;
 
         slim::common::io::Close close(sched, fd);
         co_await close;
@@ -328,8 +346,8 @@ rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
         if (reopen_fd < 0) co_return;
 
         std::vector<uint32_t> read_buf(3);
-        slim::common::io::Read read(sched, reopen_fd, read_buf); // fills up to read_buf.size() * 4 bytes
-        int n = co_await read;                                   // also a raw byte count
+        slim::common::io::Read read(sched, reopen_fd, read_buf);
+        int n = co_await read;
 
         slim::common::io::Close close2(sched, reopen_fd);
         co_await close2;
@@ -340,9 +358,7 @@ rt.post([](slim::common::io::Scheduler& sched, size_t idx) {
 ```
 
 ```cpp
-// Outbound connect with a kernel-enforced deadline. If the peer never
-// responds within 2 seconds, the kernel cancels the connect for us and
-// the coroutine sees a negative result -- no manual timer bookkeeping.
+// Outbound connect with a kernel-enforced deadline.
 rt.post([addr, addr_len](slim::common::io::Scheduler& sched, size_t idx) {
     auto job = [&sched, addr, addr_len]() -> slim::common::io::Task<void> {
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -355,11 +371,9 @@ rt.post([addr, addr_len](slim::common::io::Scheduler& sched, size_t idx) {
 
         int result = co_await connect_op;
         if (result < 0) {
-            // -ECANCELED (or -ETIME): deadline passed before connect finished
             ::close(fd);
             co_return;
         }
-        // connected -- proceed with Send/Recv on fd
     };
     auto coro = job();
     sched.spawn(std::move(coro));
@@ -367,21 +381,17 @@ rt.post([addr, addr_len](slim::common::io::Scheduler& sched, size_t idx) {
 ```
 
 ```cpp
-// Poll for readiness -- e.g. driving a non-blocking TLS handshake retry
-// loop on SSL_ERROR_WANT_READ / WANT_WRITE, without a dedicated recv/send.
+// Poll for readiness -- e.g. driving a non-blocking TLS handshake retry loop.
 auto wait_readable = [&sched, fd]() -> slim::common::io::Task<int> {
     slim::common::io::Poll poll_op(sched, fd, POLLIN);
     poll_op.with_timeout(std::chrono::milliseconds(500));
-    int revents = co_await poll_op; // >= 0 ready-mask, or negative on timeout/error
+    int revents = co_await poll_op;
     co_return revents;
 };
 ```
 
 ```cpp
 // Accept loop — serve connections on a worker until Runtime stops it.
-// A worker's Scheduler::shutdown() (invoked internally by Runtime::stop())
-// flushes pending tasks, so the loop coroutine doesn't need its own
-// stop_token — it simply runs until the worker scheduler is torn down.
 rt.post([server_fd](slim::common::io::Scheduler& sched, size_t idx) {
     auto accept_loop = [&sched, server_fd]() -> slim::common::io::Task<void> {
         while (true) {
@@ -402,11 +412,7 @@ rt.post([server_fd](slim::common::io::Scheduler& sched, size_t idx) {
 ```
 
 ```cpp
-// rt.post() is itself the thread-safe hand-off point — call it from any
-// thread (including a V8 isolate thread) to enqueue work on a worker.
-// The same rule applies to a single Scheduler in isolation: post() is
-// thread-safe, spawn() is only safe from the thread driving that
-// scheduler's own run()/drain() loop.
+// Thread-safe cross-thread posting from any thread (e.g. a V8 isolate thread).
 std::thread producer([&rt, client_fd]() {
     rt.post([client_fd](slim::common::io::Scheduler& sched, size_t idx) {
         auto send = [&sched, client_fd]() -> slim::common::io::Task<void> {
@@ -421,25 +427,19 @@ producer.join();
 ```
 
 ```cpp
-// Stop the runtime: signals dispatcher + all workers, joins their
-// threads, and shuts down every scheduler.
+// Stop the runtime.
 rt.stop();
 ```
 
 ```cpp
-// Handle IOException from Runtime construction (ring/scheduler setup
-// failures on the dispatcher or any worker surface here)
+// Handle IOException from Runtime construction.
 try {
     slim::common::io::Runtime rt(4);
     rt.start();
-    // use rt ...
     rt.stop();
 }
 catch (const slim::common::io::IOException& e) {
     std::cerr << "setup failed: " << e.what() << '\n';
-    // e.status() is one of ErrorStatus::IOSetupFailed,
-    // ErrorStatus::EpollCreateFailed, ErrorStatus::EpollCtlFailed,
-    // ErrorStatus::EventFdCreateFailed, ErrorStatus::RuntimeNotIdle, etc.
 }
 ```
 
