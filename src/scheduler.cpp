@@ -152,7 +152,6 @@ void Scheduler::drain() {
     uint32_t head = io_.cq.head->load(std::memory_order_acquire);
     uint32_t tail = io_.cq.tail->load(std::memory_order_acquire);
     if (head == tail) {
-        if (shutting_down_) return;
         // Block until either a CQE is ready on the io_uring fd or new
         // work lands on the eventfd. Do NOT block solely on
         // io_uring_enter's GETEVENTS here: if the ring is completely
