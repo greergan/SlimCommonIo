@@ -19,7 +19,8 @@ struct FinalAwaiter {
     template<typename Promise>
     std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
         auto continuation = h.promise().continuation;
-        return continuation ? continuation : std::noop_coroutine();
+        if (continuation) return continuation;
+        return std::noop_coroutine();
     }
 
     void await_resume() noexcept {}
