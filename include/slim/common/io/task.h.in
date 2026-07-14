@@ -16,7 +16,10 @@ namespace slim::common::io {
 struct FinalAwaiter {
     bool await_ready() noexcept { return false; }
 
+    // Defeat GCC -O2 tail-call optimization bug (PR 109266) when
+    // symmetrically transferring to a noop_coroutine from final_suspend.
     template<typename Promise>
+    [[gnu::noinline]]
     std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
         auto continuation = h.promise().continuation;
         if (continuation) return continuation;
