@@ -3,6 +3,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <optional>
 
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
@@ -32,7 +33,7 @@ struct FinalAwaiter {
 template<typename T>
 struct Task {
     struct Promise {
-        T                       value{};
+        std::optional<T>        value{std::nullopt};
         std::exception_ptr      exception{};
         std::coroutine_handle<> continuation{};
 
@@ -44,7 +45,7 @@ struct Task {
         FinalAwaiter         final_suspend()   noexcept { return {}; }
 
         void return_value(T v) noexcept {
-            value = std::move(v);
+            value.emplace(std::move(v));
         }
 
         void unhandled_exception() noexcept {
@@ -90,7 +91,7 @@ struct Task {
         if (handle_.promise().exception) {
             std::rethrow_exception(handle_.promise().exception);
         }
-        return std::move(handle_.promise().value);
+        return handle_.promise().value.has_value() ? std::move(handle_.promise().value.value()) : T{};
     }
 
     std::coroutine_handle<Promise> handle() const noexcept { return handle_; }
