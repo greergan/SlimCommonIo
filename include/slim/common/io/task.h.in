@@ -4,6 +4,7 @@
 #include <coroutine>
 #include <exception>
 #include <optional>
+#include <type_traits>
 
 #define SLIMCOMMONIO_VERSION  "@SLIMCOMMONIO_VERSION@"
 #define SLIMCOMMONIO_GIT_HASH "@SLIMCOMMONIO_GIT_HASH@"
@@ -91,7 +92,14 @@ struct Task {
         if (handle_.promise().exception) {
             std::rethrow_exception(handle_.promise().exception);
         }
-        return handle_.promise().value.has_value() ? std::move(handle_.promise().value.value()) : T{};
+        if (handle_.promise().value.has_value()) {
+            return std::move(handle_.promise().value.value());
+        }
+        if constexpr (std::is_default_constructible_v<T>) {
+            return T{};
+        } else {
+            std::terminate(); // result() called before coroutine completed
+        }
     }
 
     std::coroutine_handle<Promise> handle() const noexcept { return handle_; }
