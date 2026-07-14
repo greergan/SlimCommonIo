@@ -230,23 +230,25 @@ TEST_CASE("Task<T> awaiter propagates exceptions from the inner task", "[io][tas
 
 TEST_CASE("Task<T> external-driver path is unaffected by the new awaiter interface", "[io][task][awaiter]") {
     SECTION("a Task<int> never co_await-ed by anything still works via spawn()/resume()/result()") {
-        auto task = []() -> Task<int> { co_return 99; }();
-        task.resume();
-        REQUIRE(task.done());
-        REQUIRE(task.result() == 99);
-    }
+            auto coro = []() -> Task<int> { co_return 99; };
+            auto task = coro();
+            task.resume();
+            REQUIRE(task.done());
+            REQUIRE(task.result() == 99);
+        }
 
-    SECTION("a Task<void> never co_await-ed by anything still works via spawn()/resume()/result()") {
-        bool ran{false};
-        auto task = [&]() -> Task<void> {
-            ran = true;
-            co_return;
-        }();
-        task.resume();
-        REQUIRE(task.done());
-        REQUIRE(ran);
-        REQUIRE_NOTHROW(task.result());
-    }
+        SECTION("a Task<void> never co_await-ed by anything still works via spawn()/resume()/result()") {
+            bool ran{false};
+            auto coro = [&]() -> Task<void> {
+                ran = true;
+                co_return;
+            };
+            auto task = coro();
+            task.resume();
+            REQUIRE(task.done());
+            REQUIRE(ran);
+            REQUIRE_NOTHROW(task.result());
+        }
 
     SECTION("Scheduler::spawn() still drives a plain (non-nested) task to completion via I/O") {
         IO        io;
