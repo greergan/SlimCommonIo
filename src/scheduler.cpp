@@ -177,16 +177,12 @@ void Scheduler::drain() {
         if (awt) {
             awt->result = cqe.res;
             awt->handle.resume();
-            // If this resume advanced an already-in-flight coroutine
-            // into a later co_await that itself hit SQFull, the
-            // coroutine already raced through to completion with a
-            // garbage result by this point (same underlying language
-            // behavior as in start_or_defer's comment -- there is no
-            // hook to intervene once resume() has been called). We
-            // can't undo that here, but we must at least clear the
-            // thread-local flag so it doesn't leak into an unrelated
-            // spawn()/start_or_defer() check for a different task later
-            // on this thread.
+            // If the coroutine reached final_suspend after this resume,
+            // record its handle now so reap() can erase it without
+            // querying a potentially-freed frame later.
+            if (awt->handle.done()) {
+                done_handles_.push_back(awt->handle);
+            }
             take_pending_sq_error();
         }
         ++current;
@@ -195,9 +191,14 @@ void Scheduler::drain() {
 }
 
 void Scheduler::reap() {
+    if (done_handles_.empty()) return;
     tasks_.erase(
-        std::remove_if(tasks_.begin(), tasks_.end(), [](const Task<void>& t) { return t.done(); }),
+        std::remove_if(tasks_.begin(), tasks_.end(), [this](const Task<void>& t) {
+            auto h = t.handle();
+            return std::find(done_handles_.begin(), done_handles_.end(), h) != done_handles_.end();
+        }),
         tasks_.end());
+    done_handles_.clear();
 }
 
 } // namespace slim::common::io
