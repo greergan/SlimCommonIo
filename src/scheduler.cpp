@@ -191,11 +191,14 @@ void Scheduler::drain() {
 }
 
 void Scheduler::reap() {
-    if (done_handles_.empty()) return;
     tasks_.erase(
         std::remove_if(tasks_.begin(), tasks_.end(), [this](const Task<void>& t) {
             auto h = t.handle();
-            return std::find(done_handles_.begin(), done_handles_.end(), h) != done_handles_.end();
+            // completed via CQE path — recorded while frame was still valid
+            if (std::find(done_handles_.begin(), done_handles_.end(), h) != done_handles_.end())
+                return true;
+            // completed synchronously — frame is still alive, safe to query
+            return t.done();
         }),
         tasks_.end());
     done_handles_.clear();
