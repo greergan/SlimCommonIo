@@ -18,6 +18,7 @@ void Runtime::start() {
     if (state_ != State::Idle && state_ != State::Stopped)
         throw IOException(ErrorStatus::RuntimeNotIdle);
 
+    dispatcher_stop_src_ = std::stop_source{};
     dispatcher_runner_ = std::jthread([this](std::stop_token) {
         dispatcher_.run(dispatcher_stop_src_.get_token());
     });
