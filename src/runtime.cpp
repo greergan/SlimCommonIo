@@ -3,8 +3,7 @@
 
 namespace slim::common::io {
 
-Runtime::Runtime(size_t worker_count, uint32_t entries)
-    : dispatcher_io_(entries), dispatcher_(dispatcher_io_) {
+Runtime::Runtime(size_t worker_count, uint32_t entries) : dispatcher_io_(entries), dispatcher_(dispatcher_io_) {
     workers_.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i) {
         workers_.push_back(std::make_unique<WorkerNode>());
@@ -16,7 +15,7 @@ Runtime::~Runtime() {
 }
 
 void Runtime::start() {
-    if (state_ != State::Idle)
+    if (state_ != State::Idle && state_ != State::Stopped)
         throw IOException(ErrorStatus::RuntimeNotIdle);
 
     dispatcher_runner_ = std::jthread([this](std::stop_token) {
