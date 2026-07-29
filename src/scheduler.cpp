@@ -8,6 +8,7 @@
 #include <slim/common/io/operations.h>
 #include <slim/common/io/scheduler.h>
 #include <slim/common/io/task.h>
+#include <slim/common/log.h>
 
 namespace slim::common::io {
 
@@ -73,6 +74,7 @@ void Scheduler::run(std::stop_token stop_token) {
     // reuses the existing wakeup path so a stop request always breaks
     // out of the blocking wait promptly.
     std::stop_callback wake_on_stop(stop_token, [this]() {
+        log::debug(log::Message(__func__, "stop callback fired, writing to eventfd_", __FILE__, __LINE__));
         uint64_t val = 1;
         ::write(eventfd_, &val, sizeof(val));
     });

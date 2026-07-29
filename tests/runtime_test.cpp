@@ -83,6 +83,15 @@ Task<void> read_one_file_on_worker(Scheduler& scheduler, std::string path, PerWo
 
 } // namespace
 
+TEST_CASE("Runtime stops cleanly with no pending work", "[runtime][stop]") {
+    // dispatcher is idle, blocked in epoll_wait with nothing submitted —
+    // stop() must wake it via the stop callback and return without hanging
+    Runtime runtime(1);
+    runtime.start();
+    runtime.stop();
+    SUCCEED();
+}
+
 TEST_CASE("Runtime hands off work from multiple client threads to worker schedulers", "[runtime][multithread]") {
     constexpr size_t kMaxFiles         = 64;
     constexpr size_t kNumWorkers       = 4;
