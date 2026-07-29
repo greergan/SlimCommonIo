@@ -24,13 +24,22 @@ namespace slim::common::io {
 class Runtime {
 public:
     // A worker owns its own io_uring ring, its own Scheduler, and the
-    // thread that drives that scheduler's event loop.
+    // thread that drives that scheduler's event loop. The runner thread
+    // is NOT started in the constructor — call start() explicitly so
+    // that Runtime::start() controls worker lifetime and restart()
+    // can replace workers without racing against a live runner thread.
     struct WorkerNode {
-        IO           io;
-        Scheduler    scheduler{io};
+        IO        io;
+        Scheduler scheduler{io};
         std::jthread runner;
 
-        WorkerNode() : runner([this](std::stop_token stop_token) { scheduler.run(stop_token); }) {}
+        WorkerNode() = default;
+
+        void start() {
+            runner = std::jthread([this](std::stop_token stop_token) {
+                scheduler.run(stop_token);
+            });
+        }
 
         void stop_and_join() {
             runner.request_stop();
@@ -47,9 +56,7 @@ public:
     Runtime(Runtime&&)                 = delete;
     Runtime& operator=(Runtime&&)      = delete;
 
-    // Starts the dispatcher thread. Worker threads are already running
-    // (started in each WorkerNode's constructor), matching the existing
-    // test's behavior.
+    // Starts the dispatcher thread and all worker threads.
     void start();
 
     // Requests dispatcher + all worker threads to stop, joins them, and

@@ -23,9 +23,9 @@ void Runtime::start() {
         throw IOException(ErrorStatus::RuntimeNotIdle);
 
     for (auto& w : workers_) {
-        w = std::make_unique<WorkerNode>();
+        w->start();
     }
-    log::debug(log::Message(__func__, "reset workers => " + std::to_string(workers_.size()), __FILE__, __LINE__));
+    log::debug(log::Message(__func__, "workers started => " + std::to_string(workers_.size()), __FILE__, __LINE__));
     dispatcher_runner_ = std::jthread([this](std::stop_token stop_token) {
         dispatcher_.run(stop_token);
     });
