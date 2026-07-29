@@ -162,3 +162,65 @@ TEST_CASE("Runtime with a single worker still functions", "[runtime]") {
 
     CHECK(stats.completed[0].load() == 1);
 }
+
+
+
+#include <iostream>
+
+
+
+TEST_CASE("Runtime can be stopped and restarted", "[runtime][restart]") {
+    constexpr size_t kNumWorkers = 4;
+    constexpr auto   kTimeout    = std::chrono::seconds(5);
+
+    Runtime runtime(kNumWorkers);
+    PerWorkerStats stats1(kNumWorkers);
+    PerWorkerStats stats2(kNumWorkers);
+
+    // first run
+    runtime.start();
+    std::cerr << "first run: posting\n" << std::flush;
+    runtime.post([&stats1](Scheduler& scheduler, size_t idx) {
+        std::cerr << "first run: job executing on worker " << idx << "\n" << std::flush;
+        scheduler.spawn(read_one_file_on_worker(scheduler, "/etc/hostname", stats1, idx));
+    });
+    auto deadline = std::chrono::steady_clock::now() + kTimeout;
+    while (stats1.completed[0].load(std::memory_order_relaxed) +
+           stats1.completed[1].load(std::memory_order_relaxed) +
+           stats1.completed[2].load(std::memory_order_relaxed) +
+           stats1.completed[3].load(std::memory_order_relaxed) < 1) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            FAIL("Timed out waiting for first run to complete");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::cerr << "first run: completed\n" << std::flush;
+    runtime.stop();
+    std::cerr << "first run: stopped\n" << std::flush;
+
+    // second run
+    runtime.start();
+    std::cerr << "second run: posting\n" << std::flush;
+    runtime.post([&stats2](Scheduler& scheduler, size_t idx) {
+        std::cerr << "second run: job executing on worker " << idx << "\n" << std::flush;
+        scheduler.spawn(read_one_file_on_worker(scheduler, "/etc/hostname", stats2, idx));
+    });
+    deadline = std::chrono::steady_clock::now() + kTimeout;
+    while (stats2.completed[0].load(std::memory_order_relaxed) +
+           stats2.completed[1].load(std::memory_order_relaxed) +
+           stats2.completed[2].load(std::memory_order_relaxed) +
+           stats2.completed[3].load(std::memory_order_relaxed) < 1) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            FAIL("Timed out waiting for second run to complete");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::cerr << "second run: completed\n" << std::flush;
+    runtime.stop();
+
+    int total1 = 0, total2 = 0;
+    for (size_t i = 0; i < kNumWorkers; ++i) {
+        total1 += stats1.completed[i].load();
+        total2 += stats2.completed[i].load();
+    }
+    CHECK(total1 == 1);
+    CHECK(total2 == 1);
+}

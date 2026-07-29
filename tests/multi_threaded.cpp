@@ -283,15 +283,14 @@ Task<void> read_one_file_on_worker(Scheduler& scheduler, std::string path, PerWo
 // A worker owns its own io_uring ring, its own Scheduler, and the thread
 // that drives that scheduler's event loop.
 struct WorkerNode {
-    IO               io;
-    Scheduler        scheduler{io};
-    std::stop_source stop_src{};
-    std::jthread     runner;
+    IO           io;
+    Scheduler    scheduler{io};
+    std::jthread runner;
 
-    WorkerNode() : runner([this](std::stop_token) { scheduler.run(stop_src.get_token()); }) {}
+    WorkerNode() : runner([this](std::stop_token stop_token) { scheduler.run(stop_token); }) {}
 
     void stop_and_join() {
-        stop_src.request_stop();
+        runner.request_stop();
         if (runner.joinable()) runner.join();
         scheduler.shutdown();
     }

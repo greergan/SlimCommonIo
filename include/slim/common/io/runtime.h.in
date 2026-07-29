@@ -26,15 +26,14 @@ public:
     // A worker owns its own io_uring ring, its own Scheduler, and the
     // thread that drives that scheduler's event loop.
     struct WorkerNode {
-        IO               io;
-        Scheduler        scheduler{io};
-        std::stop_source stop_src{};
-        std::jthread     runner;
+        IO           io;
+        Scheduler    scheduler{io};
+        std::jthread runner;
 
-        WorkerNode() : runner([this](std::stop_token) { scheduler.run(stop_src.get_token()); }) {}
+        WorkerNode() : runner([this](std::stop_token stop_token) { scheduler.run(stop_token); }) {}
 
         void stop_and_join() {
-            stop_src.request_stop();
+            runner.request_stop();
             if (runner.joinable()) runner.join();
             scheduler.shutdown();
         }
@@ -71,10 +70,9 @@ public:
 private:
     enum class State { Idle, Running, Stopped };
 
-    IO        dispatcher_io_;
-    Scheduler dispatcher_;
-    std::stop_source dispatcher_stop_src_{};
-    std::jthread      dispatcher_runner_;
+    IO           dispatcher_io_;
+    Scheduler    dispatcher_;
+    std::jthread dispatcher_runner_;
 
     std::vector<std::unique_ptr<WorkerNode>> workers_;
     std::atomic<size_t> next_worker_{0};
