@@ -637,7 +637,7 @@ TEST_CASE("Stat", "[io][operations]") {
         sched.shutdown();
 
         REQUIRE(result == 0);
-        REQUIRE(stat_op.buf.stx_size == 1);
+        REQUIRE(stat_op.buf_.stx_size == 1);
         ::unlink(path);
     }
 
