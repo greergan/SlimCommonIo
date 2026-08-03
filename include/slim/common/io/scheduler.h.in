@@ -56,6 +56,7 @@ public:
     void post(std::function<void()> task);
     void run(std::stop_token stop_token);
     void shutdown();
+    void reset();
     int eventfd() const noexcept { return eventfd_; }
     IO& io() noexcept { return io_; }
 private:
