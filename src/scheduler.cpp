@@ -160,7 +160,6 @@ void Scheduler::reset() {
     log::trace(log::Message(__func__, "begins", __FILE__, __LINE__));
 #endif
     tasks_.clear();
-    done_handles_.clear();
     {
         std::lock_guard lock(inbox_mutex_);
         inbox_ = {};
@@ -283,15 +282,13 @@ void Scheduler::drain() {
             log::debug(log::Message(__func__, std::format("resuming awaitable=>{} result=>{}", (void*)awt, awt->result), __FILE__, __LINE__));
 #endif
             awt->handle.resume();
-            // If the coroutine reached final_suspend after this resume,
-            // record its handle now so reap() can erase it without
-            // querying a potentially-freed frame later.
-            if (awt->handle.done()) {
-#ifdef ENABLE_LOGGING
-                log::debug(log::Message(__func__, std::format("coroutine done handle=>{}", (void*)awt->handle.address()), __FILE__, __LINE__));
-#endif
-                done_handles_.push_back(awt->handle);
-            }
+            // awt->handle is an inner frame handle, not a top-level Task
+            // handle. Pushing it to done_handles_ and comparing against
+            // tasks_ entries was incorrect: the handles never matched
+            // top-level tasks, and a recycled address could false-positive
+            // reap a live task. Reaping is handled entirely by reap() via
+            // t.done() on the top-level Task, whose frame stays alive
+            // (owned by tasks_) until tasks_.erase() destroys it.
             take_pending_sq_error();
         }
         ++current;
@@ -302,29 +299,25 @@ void Scheduler::drain() {
 void Scheduler::reap() {
 #ifdef ENABLE_LOGGING
     log::trace(log::Message(__func__, "begins", __FILE__, __LINE__));
-    log::debug(log::Message(__func__, std::format("tasks=>{} done_handles=>{}", tasks_.size(), done_handles_.size()), __FILE__, __LINE__));
+    log::debug(log::Message(__func__, std::format("tasks=>{}", tasks_.size()), __FILE__, __LINE__));
 #endif
     tasks_.erase(
-        std::remove_if(tasks_.begin(), tasks_.end(), [this](const Task<void>& t) {
-            auto h = t.handle();
-            // completed via CQE path — recorded while frame was still valid
-            if (std::find(done_handles_.begin(), done_handles_.end(), h) != done_handles_.end()) {
-#ifdef ENABLE_LOGGING
-                log::debug(log::Message(__func__, std::format("reaping via done_handles handle=>{}", (void*)h.address()), __FILE__, __LINE__));
-#endif
-                return true;
-            }
-            // completed synchronously — frame is still alive, safe to query
+        std::remove_if(tasks_.begin(), tasks_.end(), [](const Task<void>& t) {
+            // t.done() is always safe here: tasks_ owns the top-level frame,
+            // so the frame is alive until tasks_.erase() destroys it below.
+            // The former done_handles_ path (matching inner frame handles
+            // against top-level task handles) was removed: inner frame handles
+            // stored in awt->handle never matched any tasks_ entry, and a
+            // recycled inner frame address could false-positive reap a live task.
             bool is_done = t.done();
 #ifdef ENABLE_LOGGING
             if (is_done) {
-                log::debug(log::Message(__func__, std::format("reaping synchronously done handle=>{}", (void*)h.address()), __FILE__, __LINE__));
+                log::debug(log::Message(__func__, std::format("reaping done handle=>{}", (void*)t.handle().address()), __FILE__, __LINE__));
             }
 #endif
             return is_done;
         }),
         tasks_.end());
-    done_handles_.clear();
 #ifdef ENABLE_LOGGING
     log::trace(log::Message(__func__, "ends", __FILE__, __LINE__));
 #endif

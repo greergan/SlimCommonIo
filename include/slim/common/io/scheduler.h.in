@@ -71,7 +71,6 @@ private:
     std::vector<Task<void>>           tasks_;
     std::queue<std::function<void()>> inbox_;
     std::mutex                        inbox_mutex_;
-    std::vector<std::coroutine_handle<>> done_handles_; // handles that completed, pending reap
     void drain_inbox();
     void drain();
     void reap();

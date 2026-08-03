@@ -1,1 +1,7 @@
 SlimCommonLog
+#only for testing
+SlimCommonTls
+#only for testing
+SlimCommonNetwork
+#only for testing
+SlimCommonNetworkClientTcp
