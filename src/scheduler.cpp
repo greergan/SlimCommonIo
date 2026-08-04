@@ -1,8 +1,8 @@
-#include <sys/epoll.h>
+#include <algorithm>
+#include <cstring>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <algorithm>
 #include <slim/common/io/awaitable.h>
 #include <slim/common/io/error_codes.h>
 #include <slim/common/io/operations.h>
@@ -25,47 +25,6 @@ Scheduler::Scheduler(IO& io_ref) : io_(io_ref) {
     }
 #ifdef ENABLE_LOGGING
     log::debug(log::Message(__func__, std::format("eventfd_=>{}", eventfd_), __FILE__, __LINE__));
-#endif
-
-    // Watch both eventfd_ (new post()ed work) and io_.fd (CQEs ready) so
-    // drain() can block on a single wait that wakes for either. Blocking
-    // only on io_uring_enter's GETEVENTS is not enough: that call only
-    // wakes on completions, so a post() that arrives while the ring is
-    // idle (nothing ever submitted) would otherwise never wake the loop.
-    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ < 0) {
-#ifdef ENABLE_LOGGING
-        log::error(log::Message(__func__, "epoll_create1 failed", __FILE__, __LINE__));
-#endif
-        ::close(eventfd_);
-        throw IOException(ErrorStatus::EpollCreateFailed);
-    }
-#ifdef ENABLE_LOGGING
-    log::debug(log::Message(__func__, std::format("epoll_fd_=>{}", epoll_fd_), __FILE__, __LINE__));
-#endif
-
-    epoll_event ev{};
-    ev.events  = EPOLLIN;
-    ev.data.fd = eventfd_;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, eventfd_, &ev) < 0) {
-#ifdef ENABLE_LOGGING
-        log::error(log::Message(__func__, "epoll_ctl add eventfd_ failed", __FILE__, __LINE__));
-#endif
-        ::close(epoll_fd_);
-        ::close(eventfd_);
-        throw IOException(ErrorStatus::EpollCtlFailed);
-    }
-
-    ev.data.fd = io_.fd;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, io_.fd, &ev) < 0) {
-#ifdef ENABLE_LOGGING
-        log::error(log::Message(__func__, "epoll_ctl add io_.fd failed", __FILE__, __LINE__));
-#endif
-        ::close(epoll_fd_);
-        ::close(eventfd_);
-        throw IOException(ErrorStatus::EpollCtlFailed);
-    }
-#ifdef ENABLE_LOGGING
     log::trace(log::Message(__func__, "ends", __FILE__, __LINE__));
 #endif
 }
@@ -80,8 +39,6 @@ Scheduler::~Scheduler() {
 #endif
         shutdown();
     }
-    if (epoll_fd_ >= 0)
-        ::close(epoll_fd_);
     if (eventfd_ >= 0)
         ::close(eventfd_);
 #ifdef ENABLE_LOGGING
@@ -113,14 +70,13 @@ void Scheduler::run(std::stop_token stop_token) {
 #ifdef ENABLE_LOGGING
     log::trace(log::Message(__func__, "begins", __FILE__, __LINE__));
 #endif
-    // A thread parked in drain()'s epoll_wait(..., -1) only wakes on
-    // eventfd_ activity or a CQE becoming ready -- it has no idea a stop
-    // was requested. Without this callback, request_stop() from another
-    // thread is invisible to a runner blocked in an idle wait: run()
-    // would never re-check stop_token, and run()'s caller (typically
-    // joining this thread) would hang forever. Writing to eventfd_ here
-    // reuses the existing wakeup path so a stop request always breaks
-    // out of the blocking wait promptly.
+    // A thread parked in drain()'s io_uring_enter GETEVENTS wait only wakes
+    // when a CQE arrives -- it has no idea a stop was requested. Without this
+    // callback, request_stop() from another thread is invisible to a runner
+    // blocked in the idle wait: run() would never re-check stop_token, and
+    // run()'s caller (typically joining this thread) would hang forever.
+    // Writing to eventfd_ here triggers the always-in-flight eventfd read CQE,
+    // which wakes io_uring_enter and lets the loop re-check stop_token.
     std::stop_callback wake_on_stop(stop_token, [this]() {
 #ifdef ENABLE_LOGGING
         log::debug(log::Message(__func__, "stop callback fired, writing to eventfd_", __FILE__, __LINE__));
@@ -150,21 +106,6 @@ void Scheduler::shutdown() {
         drain();
         reap();
     }
-#ifdef ENABLE_LOGGING
-    log::trace(log::Message(__func__, "ends", __FILE__, __LINE__));
-#endif
-}
-
-void Scheduler::reset() {
-#ifdef ENABLE_LOGGING
-    log::trace(log::Message(__func__, "begins", __FILE__, __LINE__));
-#endif
-    tasks_.clear();
-    {
-        std::lock_guard lock(inbox_mutex_);
-        inbox_ = {};
-    }
-    shutting_down_ = false;
 #ifdef ENABLE_LOGGING
     log::trace(log::Message(__func__, "ends", __FILE__, __LINE__));
 #endif
@@ -232,64 +173,80 @@ void Scheduler::drain_inbox() {
 #endif
 }
 
+void Scheduler::arm_eventfd_read() {
+    // Submit an IORING_OP_READ for eventfd_ into the ring. The resulting CQE
+    // is identified by user_data == &eventfd_buf_ (the sentinel). drain() uses
+    // this to distinguish inbox-notification CQEs from real I/O Awaitable CQEs.
+    uint32_t tail     = io_.sq.tail->load(std::memory_order_relaxed);
+    uint32_t idx      = tail & *io_.sq.mask;
+    io_.sq.array[idx] = idx;
+    io_uring_sqe* sqe = &io_.sq.sqes[idx];
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode   = IORING_OP_READ;
+    sqe->fd       = eventfd_;
+    sqe->addr     = reinterpret_cast<uint64_t>(&eventfd_buf_);
+    sqe->len      = sizeof(eventfd_buf_);
+    sqe->off      = 0;
+    sqe->user_data = reinterpret_cast<uint64_t>(&eventfd_buf_);
+    io_.sq.tail->store(tail + 1, std::memory_order_release);
+    eventfd_armed_ = true;
+#ifdef ENABLE_LOGGING
+    log::debug(log::Message(__func__, "eventfd read armed", __FILE__, __LINE__));
+#endif
+}
+
 void Scheduler::drain() {
-    // Check inbox non-blocking before submitting SQEs
-    uint64_t val{0};
-    if (::read(eventfd_, &val, sizeof(val)) > 0)
-        drain_inbox();
+    // Ensure the eventfd_ read is always in flight so io_uring_enter's
+    // GETEVENTS wakes on post() notifications as well as real I/O CQEs.
+    if (!eventfd_armed_)
+        arm_eventfd_read();
 
     uint32_t sq_head    = io_.sq.head->load(std::memory_order_acquire);
     uint32_t sq_tail    = io_.sq.tail->load(std::memory_order_relaxed);
     uint32_t sq_pending = sq_tail - sq_head;
-    if (sq_pending > 0) {
 #ifdef ENABLE_LOGGING
-        log::debug(log::Message(__func__, std::format("submitting sq_pending=>{}", sq_pending), __FILE__, __LINE__));
+    log::debug(log::Message(__func__, std::format("submitting sq_pending=>{}", sq_pending), __FILE__, __LINE__));
 #endif
-        syscall(SYS_io_uring_enter, io_.fd, sq_pending, 0, 0, nullptr, 0);
-    }
+    // Submit all pending SQEs and block until at least one CQE arrives.
+    // The always-in-flight eventfd read guarantees we wake on post() too.
+    uint32_t min_complete = shutting_down_ ? 0 : 1;
+    syscall(SYS_io_uring_enter, io_.fd, sq_pending, min_complete, IORING_ENTER_GETEVENTS, nullptr, 0);
+
+#ifdef ENABLE_LOGGING
+    log::debug(log::Message(__func__, std::format("submitted sq_pending=>{}", sq_pending), __FILE__, __LINE__));
+#endif
 
     uint32_t head = io_.cq.head->load(std::memory_order_acquire);
     uint32_t tail = io_.cq.tail->load(std::memory_order_acquire);
-    if (head == tail) {
-        // Block until either a CQE is ready on the io_uring fd or new
-        // work lands on the eventfd. Do NOT block solely on
-        // io_uring_enter's GETEVENTS here: if the ring is completely
-        // idle (nothing ever submitted, so no CQE will ever arrive) and
-        // a post() writes to eventfd_ after the non-blocking read at the
-        // top of this function, io_uring_enter would never observe that
-        // write and this thread would hang forever. epoll_wait watches
-        // both fds so either event wakes us.
-#ifdef ENABLE_LOGGING
-        log::debug(log::Message(__func__, "cq empty => epoll_wait", __FILE__, __LINE__));
-#endif
-        epoll_event events[2];
-        ::epoll_wait(epoll_fd_, events, 2, -1);
-        // Don't try to reap here -- just return and let the next drain()
-        // call (from run()'s loop) re-check the inbox and submit/reap
-        // normally. This keeps a single code path for both cases instead
-        // of duplicating the drain_inbox/submit/reap logic here.
-        return;
-    }
-
     uint32_t mask    = *io_.cq.mask;
     uint32_t current = head;
     while (current != tail) {
         const io_uring_cqe& cqe = io_.cq.cqes[current & mask];
-        auto*               awt = reinterpret_cast<Awaitable*>(cqe.user_data);
-        if (awt) {
-            awt->result = cqe.res;
+        if (cqe.user_data == reinterpret_cast<uint64_t>(&eventfd_buf_)) {
+            // Inbox notification from post(). Drain the inbox and rearm
+            // so the next drain() call will again wait for post() activity.
 #ifdef ENABLE_LOGGING
-            log::debug(log::Message(__func__, std::format("resuming awaitable=>{} result=>{}", (void*)awt, awt->result), __FILE__, __LINE__));
+            log::debug(log::Message(__func__, "eventfd read CQE => drain_inbox", __FILE__, __LINE__));
 #endif
-            awt->handle.resume();
-            // awt->handle is an inner frame handle, not a top-level Task
-            // handle. Pushing it to done_handles_ and comparing against
-            // tasks_ entries was incorrect: the handles never matched
-            // top-level tasks, and a recycled address could false-positive
-            // reap a live task. Reaping is handled entirely by reap() via
-            // t.done() on the top-level Task, whose frame stays alive
-            // (owned by tasks_) until tasks_.erase() destroys it.
-            take_pending_sq_error();
+            eventfd_armed_ = false;
+            drain_inbox();
+        } else {
+            auto* awt = reinterpret_cast<Awaitable*>(cqe.user_data);
+            if (awt) {
+                awt->result = cqe.res;
+#ifdef ENABLE_LOGGING
+                log::debug(log::Message(__func__, std::format("resuming awaitable=>{} result=>{}", (void*)awt, awt->result), __FILE__, __LINE__));
+#endif
+                awt->handle.resume();
+                // awt->handle is an inner frame handle, not a top-level Task
+                // handle. Pushing it to done_handles_ and comparing against
+                // tasks_ entries was incorrect: the handles never matched
+                // top-level tasks, and a recycled address could false-positive
+                // reap a live task. Reaping is handled entirely by reap() via
+                // t.done() on the top-level Task, whose frame stays alive
+                // (owned by tasks_) until tasks_.erase() destroys it.
+                take_pending_sq_error();
+            }
         }
         ++current;
         io_.cq.head->store(current, std::memory_order_release);

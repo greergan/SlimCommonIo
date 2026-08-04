@@ -1,5 +1,4 @@
 #pragma once
-#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <stop_token>
@@ -56,21 +55,21 @@ public:
     void post(std::function<void()> task);
     void run(std::stop_token stop_token);
     void shutdown();
-    void reset();
     int eventfd() const noexcept { return eventfd_; }
     IO& io() noexcept { return io_; }
 private:
     IO&                               io_;
     int                               eventfd_{-1};
-    // epoll instance watching both eventfd_ (new post()ed work) and
-    // io_.fd (CQEs ready). Needed because io_uring_enter's GETEVENTS wait
-    // only wakes on completions -- it will never notice a post() arriving
-    // while the ring is idle, so drain() must block on both fds together.
-    int                               epoll_fd_{-1};
+    // Buffer for the always-in-flight IORING_OP_READ on eventfd_.
+    // Watching the eventfd via the ring means io_uring_enter's GETEVENTS
+    // wakes on both real I/O CQEs and post() notifications -- no epoll needed.
+    uint64_t                          eventfd_buf_{0};
+    bool                              eventfd_armed_{false};
     bool                              shutting_down_{false};
     std::vector<Task<void>>           tasks_;
     std::queue<std::function<void()>> inbox_;
     std::mutex                        inbox_mutex_;
+    void arm_eventfd_read();
     void drain_inbox();
     void drain();
     void reap();

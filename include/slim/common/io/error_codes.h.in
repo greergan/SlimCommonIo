@@ -11,8 +11,6 @@ namespace slim::common::io {
 enum class ErrorStatus : uint32_t {
     OK,
     BadAllocation,
-    EpollCreateFailed,
-    EpollCtlFailed,
     EventFdCreateFailed,
     EventFdReadFailed,
     EventFdWriteFailed,
@@ -28,8 +26,6 @@ enum class ErrorStatus : uint32_t {
 constexpr std::string_view error_status_str[] = {
     "OK",                          // OK
     "Bad allocation",              // BadAllocation
-    "epoll create failed",         // EpollCreateFailed
-    "epoll_ctl failed",            // EpollCtlFailed
     "eventfd create failed",       // EventFdCreateFailed
     "eventfd read failed",         // EventFdReadFailed
     "eventfd write failed",        // EventFdWriteFailed

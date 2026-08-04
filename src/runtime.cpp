@@ -22,9 +22,7 @@ void Runtime::start() {
 #endif
     if (state_ != State::Idle && state_ != State::Stopped)
         throw IOException(ErrorStatus::RuntimeNotIdle);
-    dispatcher_.reset();
     for (auto& w : workers_) {
-        w->scheduler.reset();
         w->start();
     }
 #ifdef ENABLE_LOGGING
